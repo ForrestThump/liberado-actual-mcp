@@ -1,0 +1,20 @@
+[package]
+name = "liberado-actual-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "liberado-actual-mcp"
+path = "src/main.rs"
+
+[dependencies]
+turbomcp          = { version = "3.1.2", features = ["http"] }
+tokio             = { version = "1", features = ["full"] }
+reqwest           = { version = "0.12", features = ["json"] }
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+rusqlite          = { version = "0.31", features = ["bundled"] }
+tracing           = "0.1"
+tracing-subscriber = "0.3"
+tempfile          = "3"
+anyhow            = "1"
