@@ -1,12 +1,17 @@
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 use turbomcp::prelude::*;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     actual::{find_budget_file, ActualClient, SQLITE_MAGIC},
     db,
     models::{date_str_to_int, format_amount},
 };
+
+fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
+    serde_json::to_string_pretty(val).map_err(|e| McpError::internal(e.to_string()))
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -23,7 +28,7 @@ enum BudgetSource {
     Local(PathBuf),
     Server {
         client: ActualClient,
-        password: String,
+        password: SecretString,
         budget_id: Option<String>,
     },
 }
@@ -41,30 +46,33 @@ pub struct ActualServer {
 }
 
 impl ActualServer {
-    pub fn new() -> Self {
+    pub fn new() -> anyhow::Result<Self> {
         let db_path_env = std::env::var("ACTUAL_DB_PATH").ok();
         let server_url = std::env::var("ACTUAL_SERVER_URL").ok();
 
         let source = if let Some(p) = db_path_env {
             BudgetSource::Local(PathBuf::from(p))
         } else if let Some(url) = server_url {
-            let password = std::env::var("ACTUAL_PASSWORD")
-                .expect("ACTUAL_PASSWORD must be set when using ACTUAL_SERVER_URL");
+            let password = std::env::var("ACTUAL_PASSWORD").map_err(|_| {
+                anyhow::anyhow!("ACTUAL_PASSWORD must be set when using ACTUAL_SERVER_URL")
+            })?;
             BudgetSource::Server {
-                client: ActualClient::new(url),
-                password,
+                client: ActualClient::new(url)?,
+                password: SecretString::new(password),
                 budget_id: std::env::var("ACTUAL_BUDGET_ID").ok(),
             }
         } else {
-            panic!("Set either ACTUAL_DB_PATH (local SQLite) or ACTUAL_SERVER_URL + ACTUAL_PASSWORD");
+            anyhow::bail!(
+                "Set either ACTUAL_DB_PATH (local SQLite) or ACTUAL_SERVER_URL + ACTUAL_PASSWORD"
+            );
         };
 
-        Self {
+        Ok(Self {
             state: Arc::new(AppState {
                 source,
                 cache: RwLock::new(None),
             }),
-        }
+        })
     }
 
     /// Returns the path to a valid SQLite budget file, downloading if needed.
@@ -91,6 +99,23 @@ impl ActualServer {
                         path.display()
                     )));
                 }
+                {
+                    use tokio::io::AsyncReadExt;
+                    let mut f = tokio::fs::File::open(path).await.map_err(|e| {
+                        McpError::internal(format!("Cannot open {}: {e}", path.display()))
+                    })?;
+                    let mut header = [0u8; 16];
+                    f.read_exact(&mut header).await.map_err(|e| {
+                        McpError::internal(format!("Cannot read {}: {e}", path.display()))
+                    })?;
+                    if !header.starts_with(SQLITE_MAGIC) {
+                        return Err(McpError::internal(format!(
+                            "{} is not a SQLite file. Verify ACTUAL_DB_PATH points to the \
+                             db.sqlite inside your Actual Budget data directory.",
+                            path.display()
+                        )));
+                    }
+                }
                 BudgetCache {
                     db_path: path.clone(),
                     _temp_file: None,
@@ -100,7 +125,7 @@ impl ActualServer {
             }
             BudgetSource::Server { client, password, budget_id } => {
                 let token: String = client
-                    .login(password)
+                    .login(password.expose_secret())
                     .await
                     .map_err(|e| McpError::internal(format!("Login failed: {e}")))?;
 
@@ -180,9 +205,7 @@ impl ActualServer {
 impl ActualServer {
     #[tool("List all accounts with their current balances")]
     async fn list_accounts(&self) -> McpResult<String> {
-        let accounts = self.query(db::list_accounts).await?;
-        serde_json::to_string_pretty(&accounts)
-            .map_err(|e| McpError::internal(e.to_string()))
+        json_result(&self.query(db::list_accounts).await?)
     }
 
     #[tool("Get transactions for an account. account_id is optional (omit for all accounts). \
@@ -193,38 +216,43 @@ impl ActualServer {
         start_date: Option<String>,
         end_date: Option<String>,
     ) -> McpResult<String> {
-        let start = start_date.as_deref().and_then(date_str_to_int);
-        let end = end_date.as_deref().and_then(date_str_to_int);
-
-        let txns = self
-            .query(move |p| db::get_transactions(p, account_id.as_deref(), start, end))
-            .await?;
-        serde_json::to_string_pretty(&txns)
-            .map_err(|e| McpError::internal(e.to_string()))
+        let start = start_date
+            .as_deref()
+            .map(|d| {
+                date_str_to_int(d).ok_or_else(|| {
+                    McpError::internal(format!("Invalid start_date '{d}'; expected YYYY-MM-DD"))
+                })
+            })
+            .transpose()?;
+        let end = end_date
+            .as_deref()
+            .map(|d| {
+                date_str_to_int(d).ok_or_else(|| {
+                    McpError::internal(format!("Invalid end_date '{d}'; expected YYYY-MM-DD"))
+                })
+            })
+            .transpose()?;
+        json_result(
+            &self
+                .query(move |p| db::get_transactions(p, account_id.as_deref(), start, end))
+                .await?,
+        )
     }
 
     #[tool("List all category groups and their categories")]
     async fn list_categories(&self) -> McpResult<String> {
-        let groups = self.query(db::list_categories).await?;
-        serde_json::to_string_pretty(&groups)
-            .map_err(|e| McpError::internal(e.to_string()))
+        json_result(&self.query(db::list_categories).await?)
     }
 
     #[tool("List all payees")]
     async fn list_payees(&self) -> McpResult<String> {
-        let payees = self.query(db::list_payees).await?;
-        serde_json::to_string_pretty(&payees)
-            .map_err(|e| McpError::internal(e.to_string()))
+        json_result(&self.query(db::list_payees).await?)
     }
 
     #[tool("Get the budget and actual spending for each category in a month. \
             month format: YYYY-MM (e.g. 2024-03)")]
     async fn get_budget_month(&self, month: String) -> McpResult<String> {
-        let result = self
-            .query(move |p| db::get_budget_month(p, &month))
-            .await?;
-        serde_json::to_string_pretty(&result)
-            .map_err(|e| McpError::internal(e.to_string()))
+        json_result(&self.query(move |p| db::get_budget_month(p, &month)).await?)
     }
 
     #[tool("Summarize income, expenses, and net savings month by month. \
@@ -234,11 +262,11 @@ impl ActualServer {
         start_month: String,
         end_month: String,
     ) -> McpResult<String> {
-        let result = self
-            .query(move |p| db::monthly_summary(p, &start_month, &end_month))
-            .await?;
-        serde_json::to_string_pretty(&result)
-            .map_err(|e| McpError::internal(e.to_string()))
+        json_result(
+            &self
+                .query(move |p| db::monthly_summary(p, &start_month, &end_month))
+                .await?,
+        )
     }
 
     #[tool("Aggregate spending by category between two dates (YYYY-MM-DD). \
@@ -249,16 +277,12 @@ impl ActualServer {
         end_date: String,
     ) -> McpResult<String> {
         let start = date_str_to_int(&start_date).ok_or_else(|| {
-            McpError::internal("Invalid start_date; expected YYYY-MM-DD".to_string())
+            McpError::internal(format!("Invalid start_date '{start_date}'; expected YYYY-MM-DD"))
         })?;
         let end = date_str_to_int(&end_date).ok_or_else(|| {
-            McpError::internal("Invalid end_date; expected YYYY-MM-DD".to_string())
+            McpError::internal(format!("Invalid end_date '{end_date}'; expected YYYY-MM-DD"))
         })?;
-        let result = self
-            .query(move |p| db::spending_by_category(p, start, end))
-            .await?;
-        serde_json::to_string_pretty(&result)
-            .map_err(|e| McpError::internal(e.to_string()))
+        json_result(&self.query(move |p| db::spending_by_category(p, start, end)).await?)
     }
 
     #[tool("Re-download the latest budget data from the Actual Budget server (server mode only). \

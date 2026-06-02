@@ -1,7 +1,15 @@
+use anyhow::bail;
 use reqwest::Client;
 use std::time::Duration;
 
 use crate::models::{ApiResponse, LoginData, UserFile};
+
+fn check_response<T>(resp: ApiResponse<T>, context: &str) -> anyhow::Result<T> {
+    if resp.status != "ok" {
+        bail!("{context}: server returned status '{}'", resp.status);
+    }
+    resp.data.ok_or_else(|| anyhow::anyhow!("{context}: response data was null"))
+}
 
 pub struct ActualClient {
     client: Client,
@@ -9,14 +17,13 @@ pub struct ActualClient {
 }
 
 impl ActualClient {
-    pub fn new(server_url: String) -> Self {
-        Self {
+    pub fn new(server_url: String) -> anyhow::Result<Self> {
+        Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
-                .build()
-                .expect("failed to build HTTP client"),
+                .build()?,
             server_url,
-        }
+        })
     }
 
     pub async fn login(&self, password: &str) -> anyhow::Result<String> {
@@ -30,7 +37,7 @@ impl ActualClient {
             .error_for_status()?
             .json()
             .await?;
-        Ok(resp.data.token)
+        Ok(check_response(resp, "login")?.token)
     }
 
     pub async fn list_files(&self, token: &str) -> anyhow::Result<Vec<UserFile>> {
@@ -44,7 +51,10 @@ impl ActualClient {
             .error_for_status()?
             .json()
             .await?;
-        Ok(resp.data.into_iter().filter(|f| !f.deleted).collect())
+        Ok(check_response(resp, "list files")?
+            .into_iter()
+            .filter(|f| !f.deleted)
+            .collect())
     }
 
     pub async fn download_file(&self, token: &str, file_id: &str) -> anyhow::Result<Vec<u8>> {
