@@ -116,7 +116,7 @@ Or for a running HTTP server:
 | `ACTUAL_SERVER_URL` | Server mode | URL of your Actual Budget server |
 | `ACTUAL_PASSWORD` | Server mode | Server password |
 | `ACTUAL_BUDGET_ID` | Server mode | Budget sync ID (uses first if omitted) |
-| `BIND_ADDR` | No | Listen address (default: `0.0.0.0:8000`) |
+| `BIND_ADDR` | No | Enables HTTP transport on this address; binary defaults to STDIO when unset (Docker image sets `0.0.0.0:8000`) |
 
 ---
 

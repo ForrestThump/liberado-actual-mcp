@@ -13,15 +13,14 @@ pub fn list_accounts(path: &std::path::Path) -> rusqlite::Result<Vec<Account>> {
     let conn = open(path)?;
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, COALESCE(a.type, 'other'), a.offbudget, a.closed,
-                COALESCE((
-                    SELECT SUM(t.amount)
-                    FROM transactions t
-                    WHERE t.acct = a.id
-                      AND t.tombstone = 0
-                      AND (t.is_child = 0 OR t.is_child IS NULL)
-                ), 0)
+                COALESCE(SUM(t.amount), 0) AS balance
          FROM accounts a
+         LEFT JOIN transactions t
+           ON t.acct = a.id
+           AND t.tombstone = 0
+           AND (t.is_child = 0 OR t.is_child IS NULL)
          WHERE a.tombstone = 0
+         GROUP BY a.id, a.name, a.type, a.offbudget, a.closed, a.sort_order
          ORDER BY a.sort_order, a.name",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -44,6 +43,7 @@ pub fn get_transactions(
     account_id: Option<&str>,
     start_date: Option<i64>,
     end_date: Option<i64>,
+    limit: i64,
 ) -> rusqlite::Result<Vec<Transaction>> {
     let conn = open(path)?;
 
@@ -62,10 +62,11 @@ pub fn get_transactions(
            AND (?1 IS NULL OR t.acct = ?1)
            AND (?2 IS NULL OR t.date >= ?2)
            AND (?3 IS NULL OR t.date <= ?3)
-         ORDER BY t.date DESC, t.id",
+         ORDER BY t.date DESC, t.id
+         LIMIT ?4",
     )?;
 
-    let rows = stmt.query_map(params![account_id, start_date, end_date], |row| {
+    let rows = stmt.query_map(params![account_id, start_date, end_date, limit], |row| {
         let raw_date: i64 = row.get(1)?;
         let amount: i64 = row.get(2)?;
         Ok(Transaction {
@@ -294,7 +295,7 @@ pub fn spending_by_category(
            AND (t.is_child = 0 OR t.is_child IS NULL)
            AND t.amount < 0
            AND t.date >= ?1 AND t.date <= ?2
-         GROUP BY t.category
+         GROUP BY c.id
          ORDER BY total ASC",
     )?;
 
@@ -309,6 +310,21 @@ pub fn spending_by_category(
         })
     })?;
     rows.collect()
+}
+
+pub fn net_worth(path: &std::path::Path) -> rusqlite::Result<i64> {
+    let conn = open(path)?;
+    conn.query_row(
+        "SELECT COALESCE(SUM(t.amount), 0)
+         FROM transactions t
+         JOIN accounts a ON a.id = t.acct AND a.tombstone = 0
+         WHERE t.tombstone = 0
+           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND a.closed = 0
+           AND a.offbudget = 0",
+        [],
+        |row| row.get(0),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -401,7 +417,7 @@ mod tests {
     #[test]
     fn get_transactions_all_accounts() {
         let db = test_db();
-        let txns = get_transactions(db.path(), None, None, None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500).unwrap();
         // 4 non-child transactions inserted
         assert_eq!(txns.len(), 4);
     }
@@ -409,7 +425,7 @@ mod tests {
     #[test]
     fn get_transactions_filter_by_account() {
         let db = test_db();
-        let txns = get_transactions(db.path(), Some("acc2"), None, None).unwrap();
+        let txns = get_transactions(db.path(), Some("acc2"), None, None, 500).unwrap();
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].amount_cents, -3000);
     }
@@ -418,7 +434,7 @@ mod tests {
     fn get_transactions_filter_by_date() {
         let db = test_db();
         let txns =
-            get_transactions(db.path(), None, Some(20240201), Some(20240228)).unwrap();
+            get_transactions(db.path(), None, Some(20240201), Some(20240228), 500).unwrap();
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].date, "2024-02-01");
     }
@@ -537,8 +553,18 @@ mod tests {
         // Previously "" was a sentinel that disabled the account filter, returning
         // all transactions. Now it's treated as a literal (non-matching) value.
         let db = test_db();
-        let txns = get_transactions(db.path(), Some(""), None, None).unwrap();
+        let txns = get_transactions(db.path(), Some(""), None, None, 500).unwrap();
         assert_eq!(txns.len(), 0, "empty account_id should match no accounts");
+    }
+
+    #[test]
+    fn net_worth_on_budget_accounts_only() {
+        // acc1 (on-budget): -5000 + -2000 + 100000 = 93000
+        // acc2 (on-budget): -3000
+        // net worth = 93000 + (-3000) = 90000
+        let db = test_db();
+        let nw = net_worth(db.path()).unwrap();
+        assert_eq!(nw, 90000);
     }
 
     #[test]

@@ -17,11 +17,8 @@ fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
 
 struct BudgetCache {
     db_path: PathBuf,
-    // Kept alive to prevent the temp file from being deleted.
+    // Held to prevent deletion of the temp file until all in-flight queries finish.
     _temp_file: Option<tempfile::NamedTempFile>,
-    // Retained for `refresh` in server mode.
-    token: Option<String>,
-    file_id: Option<String>,
 }
 
 enum BudgetSource {
@@ -35,7 +32,8 @@ enum BudgetSource {
 
 struct AppState {
     source: BudgetSource,
-    cache: RwLock<Option<BudgetCache>>,
+    // Arc so query closures can hold a reference that keeps _temp_file alive.
+    cache: RwLock<Option<Arc<BudgetCache>>>,
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -75,20 +73,24 @@ impl ActualServer {
         })
     }
 
-    /// Returns the path to a valid SQLite budget file, downloading if needed.
-    async fn db_path(&self) -> McpResult<PathBuf> {
+    /// Returns an Arc to the populated cache, downloading the budget file if needed.
+    ///
+    /// Callers must hold the returned Arc for the lifetime of any I/O that uses the
+    /// cache's db_path. This keeps _temp_file alive and prevents a race where refresh
+    /// could delete the temp file while a concurrent query is still opening it.
+    async fn db_cache(&self) -> McpResult<Arc<BudgetCache>> {
         // Fast path: cache already populated.
         {
             let r = self.state.cache.read().await;
             if let Some(c) = r.as_ref() {
-                return Ok(c.db_path.clone());
+                return Ok(Arc::clone(c));
             }
         }
 
         let mut w = self.state.cache.write().await;
         // Re-check after acquiring write lock.
         if let Some(c) = w.as_ref() {
-            return Ok(c.db_path.clone());
+            return Ok(Arc::clone(c));
         }
 
         let cache = match &self.state.source {
@@ -119,17 +121,15 @@ impl ActualServer {
                 BudgetCache {
                     db_path: path.clone(),
                     _temp_file: None,
-                    token: None,
-                    file_id: None,
                 }
             }
             BudgetSource::Server { client, password, budget_id } => {
-                let token: String = client
+                let token = client
                     .login(password.expose_secret())
                     .await
                     .map_err(|e| McpError::internal(format!("Login failed: {e}")))?;
 
-                let files: Vec<crate::models::UserFile> = client
+                let files = client
                     .list_files(&token)
                     .await
                     .map_err(|e| McpError::internal(format!("Failed to list files: {e}")))?;
@@ -148,7 +148,7 @@ impl ActualServer {
                     ));
                 }
 
-                let bytes: Vec<u8> = client
+                let bytes = client
                     .download_file(&token, &file.file_id)
                     .await
                     .map_err(|e| McpError::internal(format!("Download failed: {e}")))?;
@@ -169,33 +169,36 @@ impl ActualServer {
                 tmp.write_all(&bytes)
                     .map_err(|e| McpError::internal(format!("Write error: {e}")))?;
                 let db_path = tmp.path().to_path_buf();
-                let fid = file.file_id.clone();
-
                 BudgetCache {
                     db_path,
                     _temp_file: Some(tmp),
-                    token: Some(token),
-                    file_id: Some(fid),
                 }
             }
         };
 
-        let path = cache.db_path.clone();
-        *w = Some(cache);
-        Ok(path)
+        let arc = Arc::new(cache);
+        *w = Some(Arc::clone(&arc));
+        Ok(arc)
     }
 
     /// Run a SQLite query on a blocking thread.
+    ///
+    /// The Arc<BudgetCache> is moved into the closure so the temp file (if any)
+    /// cannot be dropped until this task completes, preventing a race with refresh.
     async fn query<F, T>(&self, f: F) -> McpResult<T>
     where
         F: FnOnce(&std::path::Path) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let path = self.db_path().await?;
-        tokio::task::spawn_blocking(move || f(&path))
-            .await
-            .map_err(|e| McpError::internal(e.to_string()))?
-            .map_err(|e| McpError::internal(format!("Database error: {e}")))
+        let cache = self.db_cache().await?;
+        let path = cache.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _keep = cache;
+            f(&path)
+        })
+        .await
+        .map_err(|e| McpError::internal(e.to_string()))?
+        .map_err(|e| McpError::internal(format!("Database error: {e}")))
     }
 }
 
@@ -209,12 +212,14 @@ impl ActualServer {
     }
 
     #[tool("Get transactions for an account. account_id is optional (omit for all accounts). \
-            start_date and end_date are optional ISO dates (YYYY-MM-DD).")]
+            start_date and end_date are optional ISO dates (YYYY-MM-DD). \
+            limit caps the number returned (default 500, max 2000).")]
     async fn get_transactions(
         &self,
         account_id: Option<String>,
         start_date: Option<String>,
         end_date: Option<String>,
+        limit: Option<i64>,
     ) -> McpResult<String> {
         let start = start_date
             .as_deref()
@@ -232,9 +237,10 @@ impl ActualServer {
                 })
             })
             .transpose()?;
+        let limit = limit.unwrap_or(500).clamp(1, 2000);
         json_result(
             &self
-                .query(move |p| db::get_transactions(p, account_id.as_deref(), start, end))
+                .query(move |p| db::get_transactions(p, account_id.as_deref(), start, end, limit))
                 .await?,
         )
     }
@@ -288,29 +294,19 @@ impl ActualServer {
     #[tool("Re-download the latest budget data from the Actual Budget server (server mode only). \
             In local mode this is a no-op and just confirms the file path.")]
     async fn refresh(&self) -> McpResult<String> {
-        // Drop the cache so the next db_path() call triggers a fresh download.
+        // Drop the cache entry; in-flight queries hold their own Arc so their
+        // temp files stay alive until those tasks complete.
         {
             let mut w = self.state.cache.write().await;
             *w = None;
         }
-        let path = self.db_path().await?;
-        Ok(format!(
-            "Budget loaded from: {}",
-            path.display()
-        ))
+        let cache = self.db_cache().await?;
+        Ok(format!("Budget loaded from: {}", cache.db_path.display()))
     }
 
     #[tool("Return the net worth across all non-closed, on-budget accounts")]
     async fn net_worth(&self) -> McpResult<String> {
-        let accounts = self.query(db::list_accounts).await?;
-        let total: i64 = accounts
-            .iter()
-            .filter(|a| !a.closed && !a.offbudget)
-            .map(|a| a.balance_cents)
-            .sum();
-        Ok(format!(
-            "Net worth (on-budget accounts): {}",
-            format_amount(total)
-        ))
+        let total = self.query(db::net_worth).await?;
+        Ok(format!("Net worth (on-budget accounts): {}", format_amount(total)))
     }
 }
