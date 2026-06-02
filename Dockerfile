@@ -8,8 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --create-home --uid 1001 app
 COPY --from=builder /build/target/release/liberado-actual-mcp /usr/local/bin/
 ENV BIND_ADDR=0.0.0.0:8000
 EXPOSE 8000
+USER app
 ENTRYPOINT ["liberado-actual-mcp"]
