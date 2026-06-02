@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub struct ApiResponse<T> {
     pub status: String,
-    pub data: T,
+    pub data: Option<T>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -18,6 +18,7 @@ pub struct UserFile {
     #[serde(rename = "fileId")]
     pub file_id: String,
     pub name: String,
+    #[serde(default)]
     pub deleted: bool,
     #[serde(rename = "encryptKeyId")]
     pub encrypt_key_id: Option<String>,

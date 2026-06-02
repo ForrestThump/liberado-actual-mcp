@@ -170,19 +170,20 @@ pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, COALESCE(cg.name, ''),
                 COALESCE(zb.amount, 0) AS budgeted,
-                COALESCE((
-                    SELECT SUM(t.amount)
-                    FROM transactions t
-                    WHERE t.category = c.id
-                      AND t.tombstone = 0
-                      AND (t.is_child = 0 OR t.is_child IS NULL)
-                      AND t.date >= ?2 AND t.date < ?3
-                ), 0) AS spent
+                COALESCE(ts.spent, 0) AS spent
          FROM categories c
          LEFT JOIN category_groups cg ON cg.id = c.cat_group AND cg.tombstone = 0
          LEFT JOIN zero_budgets zb
                ON zb.category = c.id
               AND (zb.month = ?1 OR zb.month = CAST(REPLACE(?1, '-', '') AS INTEGER))
+         LEFT JOIN (
+             SELECT category, SUM(amount) AS spent
+             FROM transactions
+             WHERE tombstone = 0
+               AND (is_child = 0 OR is_child IS NULL)
+               AND date >= ?2 AND date < ?3
+             GROUP BY category
+         ) ts ON ts.category = c.id
          WHERE c.tombstone = 0 AND COALESCE(c.hidden, 0) = 0
          ORDER BY cg.sort_order, c.sort_order, c.name",
     )?;
@@ -464,6 +465,62 @@ mod tests {
         assert_eq!(jan.expenses_cents, -10000);
         let feb = summary.iter().find(|m| m.month == "2024-02").unwrap();
         assert_eq!(feb.income_cents, 100000);
+    }
+
+    /// Real Actual Budget databases store zero_budgets.month as an INTEGER (e.g. 202401).
+    /// This test verifies the dual-format JOIN condition handles that correctly.
+    fn test_db_int_months() -> NamedTempFile {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let conn = Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE category_groups (
+                id TEXT, name TEXT, is_income INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0, tombstone INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE categories (
+                id TEXT, name TEXT, cat_group TEXT,
+                is_income INTEGER DEFAULT 0, hidden INTEGER DEFAULT 0,
+                tombstone INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE transactions (
+                id TEXT, acct TEXT, date INTEGER, amount INTEGER,
+                description TEXT, notes TEXT, category TEXT,
+                cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
+                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0
+             );
+             -- month column stores INTEGER values as Actual Budget does in production
+             CREATE TABLE zero_budgets (
+                id TEXT, month INTEGER, category TEXT, amount INTEGER
+             );
+             INSERT INTO category_groups VALUES ('grp1','Bills',0,0,0,1);
+             INSERT INTO categories VALUES ('cat1','Groceries','grp1',0,0,0,1);
+             INSERT INTO categories VALUES ('cat2','Utilities','grp1',0,0,0,2);
+             INSERT INTO transactions VALUES
+                 ('t1','acc1',20240115,-5000,'pay1','shop','cat1',1,0,0,0);
+             INSERT INTO transactions VALUES
+                 ('t2','acc1',20240120,-2000,'pay2',NULL,'cat2',1,0,0,0);
+             INSERT INTO zero_budgets VALUES ('zb1',202401,'cat1',60000);
+             INSERT INTO zero_budgets VALUES ('zb2',202401,'cat2',10000);",
+        )
+        .expect("schema");
+        drop(conn);
+        tmp
+    }
+
+    #[test]
+    fn get_budget_month_with_integer_month_storage() {
+        let db = test_db_int_months();
+        let bm = get_budget_month(db.path(), "2024-01").unwrap();
+        assert_eq!(bm.month, "2024-01");
+        assert_eq!(bm.categories.len(), 2);
+        let groceries = bm
+            .categories
+            .iter()
+            .find(|c| c.category_name == "Groceries")
+            .unwrap();
+        assert_eq!(groceries.budgeted_cents, 60000);
+        assert_eq!(groceries.spent_cents, -5000);
     }
 
     #[test]
