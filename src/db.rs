@@ -47,12 +47,6 @@ pub fn get_transactions(
 ) -> rusqlite::Result<Vec<Transaction>> {
     let conn = open(path)?;
 
-    // Sentinel values: empty string / 0 means "no filter".
-    // The SQL always has exactly 3 params so rusqlite never sees a mismatch.
-    let acct = account_id.unwrap_or("");
-    let start = start_date.unwrap_or(0);
-    let end = end_date.unwrap_or(0);
-
     let mut stmt = conn.prepare(
         "SELECT t.id, t.date, t.amount,
                 COALESCE(p.name, ''),
@@ -65,13 +59,13 @@ pub fn get_transactions(
          LEFT JOIN categories c ON c.id = t.category AND c.tombstone = 0
          WHERE t.tombstone = 0
            AND (t.is_child = 0 OR t.is_child IS NULL)
-           AND (?1 = '' OR t.acct = ?1)
-           AND (?2 = 0  OR t.date >= ?2)
-           AND (?3 = 0  OR t.date <= ?3)
+           AND (?1 IS NULL OR t.acct = ?1)
+           AND (?2 IS NULL OR t.date >= ?2)
+           AND (?3 IS NULL OR t.date <= ?3)
          ORDER BY t.date DESC, t.id",
     )?;
 
-    let rows = stmt.query_map(params![acct, start, end], |row| {
+    let rows = stmt.query_map(params![account_id, start_date, end_date], |row| {
         let raw_date: i64 = row.get(1)?;
         let amount: i64 = row.get(2)?;
         Ok(Transaction {
@@ -108,14 +102,15 @@ pub fn list_categories(path: &std::path::Path) -> rusqlite::Result<Vec<CategoryG
         })?
         .collect::<rusqlite::Result<_>>()?;
 
+    let mut cat_stmt = conn.prepare(
+        "SELECT id, name, COALESCE(is_income, 0), COALESCE(hidden, 0)
+         FROM categories
+         WHERE cat_group = ?1 AND tombstone = 0
+         ORDER BY sort_order, name",
+    )?;
+
     let mut result = Vec::new();
     for (gid, gname, is_income) in groups {
-        let mut cat_stmt = conn.prepare(
-            "SELECT id, name, COALESCE(is_income, 0), COALESCE(hidden, 0)
-             FROM categories
-             WHERE cat_group = ?1 AND tombstone = 0
-             ORDER BY sort_order, name",
-        )?;
         let cats: Vec<Category> = cat_stmt
             .query_map([&gid], |row| {
                 Ok(Category {
@@ -214,8 +209,11 @@ pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result
     Ok(BudgetMonth {
         month: month.to_string(),
         categories: cats,
+        total_budgeted_cents: total_budgeted,
         total_budgeted_display: format_amount(total_budgeted),
+        total_spent_cents: total_spent,
         total_spent_display: format_amount(total_spent),
+        total_balance_cents: total_balance,
         total_balance_display: format_amount(total_balance),
     })
 }
@@ -532,5 +530,24 @@ mod tests {
         for s in &spending {
             assert!(s.total_cents < 0, "expected negative total");
         }
+    }
+
+    #[test]
+    fn get_transactions_empty_account_id_returns_zero_not_all() {
+        // Previously "" was a sentinel that disabled the account filter, returning
+        // all transactions. Now it's treated as a literal (non-matching) value.
+        let db = test_db();
+        let txns = get_transactions(db.path(), Some(""), None, None).unwrap();
+        assert_eq!(txns.len(), 0, "empty account_id should match no accounts");
+    }
+
+    #[test]
+    fn get_budget_month_includes_cents_totals() {
+        let db = test_db();
+        let bm = get_budget_month(db.path(), "2024-01").unwrap();
+        // Verify cents totals are present and consistent with display values
+        assert_eq!(bm.total_budgeted_cents, bm.categories.iter().map(|c| c.budgeted_cents).sum::<i64>());
+        assert_eq!(bm.total_spent_cents, bm.categories.iter().map(|c| c.spent_cents).sum::<i64>());
+        assert_eq!(bm.total_balance_cents, bm.total_budgeted_cents + bm.total_spent_cents);
     }
 }

@@ -91,8 +91,11 @@ pub struct BudgetCategory {
 pub struct BudgetMonth {
     pub month: String,
     pub categories: Vec<BudgetCategory>,
+    pub total_budgeted_cents: i64,
     pub total_budgeted_display: String,
+    pub total_spent_cents: i64,
     pub total_spent_display: String,
+    pub total_balance_cents: i64,
     pub total_balance_display: String,
 }
 
@@ -148,6 +151,7 @@ pub fn date_str_to_int(s: &str) -> Option<i64> {
     let y: i64 = parts[0].parse().ok()?;
     let m: i64 = parts[1].parse().ok()?;
     let d: i64 = parts[2].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
     Some(y * 10000 + m * 100 + d)
 }
 
@@ -157,6 +161,7 @@ pub fn month_bounds(month: &str) -> Option<(i64, i64)> {
     if parts.len() != 2 { return None; }
     let y: i64 = parts[0].parse().ok()?;
     let m: i64 = parts[1].parse().ok()?;
+    if !(1..=12).contains(&m) { return None; }
     let start = y * 10000 + m * 100 + 1;
     let (next_y, next_m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     let end = next_y * 10000 + next_m * 100 + 1;
@@ -201,6 +206,11 @@ mod tests {
         assert_eq!(date_str_to_int("not-a-date"), None);
         assert_eq!(date_str_to_int("2024"), None);
         assert_eq!(date_str_to_int(""), None);
+        // Out-of-range month and day are rejected
+        assert_eq!(date_str_to_int("2024-00-01"), None);
+        assert_eq!(date_str_to_int("2024-13-01"), None);
+        assert_eq!(date_str_to_int("2024-01-00"), None);
+        assert_eq!(date_str_to_int("2024-01-32"), None);
     }
 
     #[test]
@@ -218,5 +228,8 @@ mod tests {
     fn month_bounds_invalid() {
         assert_eq!(month_bounds("2024"), None);
         assert_eq!(month_bounds("not-valid"), None);
+        // Out-of-range months are rejected
+        assert_eq!(month_bounds("2024-00"), None);
+        assert_eq!(month_bounds("2024-13"), None);
     }
 }
