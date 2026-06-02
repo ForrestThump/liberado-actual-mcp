@@ -6,7 +6,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::{
     actual::{find_budget_file, ActualClient, SQLITE_MAGIC},
     db,
-    models::{date_str_to_int, format_amount},
+    models::{date_str_to_int, format_amount, month_bounds},
 };
 
 fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
@@ -225,7 +225,7 @@ impl ActualServer {
             .as_deref()
             .map(|d| {
                 date_str_to_int(d).ok_or_else(|| {
-                    McpError::internal(format!("Invalid start_date '{d}'; expected YYYY-MM-DD"))
+                    McpError::invalid_params(format!("Invalid start_date '{d}'; expected YYYY-MM-DD"))
                 })
             })
             .transpose()?;
@@ -233,7 +233,7 @@ impl ActualServer {
             .as_deref()
             .map(|d| {
                 date_str_to_int(d).ok_or_else(|| {
-                    McpError::internal(format!("Invalid end_date '{d}'; expected YYYY-MM-DD"))
+                    McpError::invalid_params(format!("Invalid end_date '{d}'; expected YYYY-MM-DD"))
                 })
             })
             .transpose()?;
@@ -258,7 +258,14 @@ impl ActualServer {
     #[tool("Get the budget and actual spending for each category in a month. \
             month format: YYYY-MM (e.g. 2024-03)")]
     async fn get_budget_month(&self, month: String) -> McpResult<String> {
-        json_result(&self.query(move |p| db::get_budget_month(p, &month)).await?)
+        let (start, end) = month_bounds(&month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
+        })?;
+        json_result(
+            &self
+                .query(move |p| db::get_budget_month(p, &month, start, end))
+                .await?,
+        )
     }
 
     #[tool("Summarize income, expenses, and net savings month by month. \
@@ -268,9 +275,15 @@ impl ActualServer {
         start_month: String,
         end_month: String,
     ) -> McpResult<String> {
+        let (start_date, _) = month_bounds(&start_month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid start_month '{start_month}'; expected YYYY-MM"))
+        })?;
+        let (_, end_date) = month_bounds(&end_month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid end_month '{end_month}'; expected YYYY-MM"))
+        })?;
         json_result(
             &self
-                .query(move |p| db::monthly_summary(p, &start_month, &end_month))
+                .query(move |p| db::monthly_summary(p, start_date, end_date))
                 .await?,
         )
     }
@@ -283,10 +296,10 @@ impl ActualServer {
         end_date: String,
     ) -> McpResult<String> {
         let start = date_str_to_int(&start_date).ok_or_else(|| {
-            McpError::internal(format!("Invalid start_date '{start_date}'; expected YYYY-MM-DD"))
+            McpError::invalid_params(format!("Invalid start_date '{start_date}'; expected YYYY-MM-DD"))
         })?;
         let end = date_str_to_int(&end_date).ok_or_else(|| {
-            McpError::internal(format!("Invalid end_date '{end_date}'; expected YYYY-MM-DD"))
+            McpError::invalid_params(format!("Invalid end_date '{end_date}'; expected YYYY-MM-DD"))
         })?;
         json_result(&self.query(move |p| db::spending_by_category(p, start, end)).await?)
     }
