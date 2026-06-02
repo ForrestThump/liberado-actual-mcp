@@ -55,7 +55,10 @@ pub fn get_transactions(
                 COALESCE(t.cleared, 0),
                 COALESCE(t.reconciled, 0)
          FROM transactions t
-         LEFT JOIN payees p ON p.id = t.description AND p.tombstone = 0
+         -- Resolve payees through payee_mapping so merged payees (whose
+         -- description points at a tombstoned id) still show the surviving name.
+         LEFT JOIN payee_mapping pm ON pm.id = t.description
+         LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
          LEFT JOIN categories c ON c.id = t.category AND c.tombstone = 0
          WHERE t.tombstone = 0
            AND (t.is_child = 0 OR t.is_child IS NULL)
@@ -151,32 +154,41 @@ pub fn list_payees(path: &std::path::Path) -> rusqlite::Result<Vec<Payee>> {
     rows.collect()
 }
 
-pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result<BudgetMonth> {
-    let (start, end) = match month_bounds(month) {
-        Some(b) => b,
-        None => {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "Invalid month format; expected YYYY-MM".to_string(),
-            ))
-        }
-    };
-
+/// `month` is "YYYY-MM" (for display and the YYYYMM budget-table lookup);
+/// `start`/`end` are the YYYYMMDD bounds [start, end) for the month. The caller
+/// is responsible for validating the month format and computing the bounds.
+pub fn get_budget_month(
+    path: &std::path::Path,
+    month: &str,
+    start: i64,
+    end: i64,
+) -> rusqlite::Result<BudgetMonth> {
     let conn = open(path)?;
 
+    // Budget amounts live in zero_budgets (envelope) or reflect_budgets
+    // (tracking) depending on the budget type; both tables always exist, and a
+    // category appears in only one, so UNION ALL reads whichever is in use.
+    // month is stored as an integer YYYYMM (e.g. 202401).
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, COALESCE(cg.name, ''),
                 COALESCE(zb.amount, 0) AS budgeted,
                 COALESCE(ts.spent, 0) AS spent
          FROM categories c
          LEFT JOIN category_groups cg ON cg.id = c.cat_group AND cg.tombstone = 0
-         LEFT JOIN zero_budgets zb
+         LEFT JOIN (
+             SELECT category, month, amount FROM zero_budgets
+             UNION ALL
+             SELECT category, month, amount FROM reflect_budgets
+         ) zb
                ON zb.category = c.id
-              AND (zb.month = ?1 OR zb.month = CAST(REPLACE(?1, '-', '') AS INTEGER))
+              AND zb.month = CAST(REPLACE(?1, '-', '') AS INTEGER)
          LEFT JOIN (
              SELECT category, SUM(amount) AS spent
              FROM transactions
              WHERE tombstone = 0
-               AND (is_child = 0 OR is_child IS NULL)
+               -- Split categories live on child rows; the parent holds the
+               -- total with a NULL category. Exclude parents, keep children.
+               AND (is_parent = 0 OR is_parent IS NULL)
                AND date >= ?2 AND date < ?3
              GROUP BY category
          ) ts ON ts.category = c.id
@@ -219,28 +231,14 @@ pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result
     })
 }
 
+/// `start_date`/`end_date` are YYYYMMDD bounds [start_date, end_date), i.e. the
+/// first day of the start month through the first day of the month *after* the
+/// end month. The caller validates the month strings and computes these bounds.
 pub fn monthly_summary(
     path: &std::path::Path,
-    start_month: &str,
-    end_month: &str,
+    start_date: i64,
+    end_date: i64,
 ) -> rusqlite::Result<Vec<MonthSummary>> {
-    let (start_date, _) = match month_bounds(start_month) {
-        Some(b) => b,
-        None => {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "Invalid start_month format; expected YYYY-MM".to_string(),
-            ))
-        }
-    };
-    let (_, end_date) = match month_bounds(end_month) {
-        Some(b) => b,
-        None => {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "Invalid end_month format; expected YYYY-MM".to_string(),
-            ))
-        }
-    };
-
     let conn = open(path)?;
 
     // Group by month via integer arithmetic: YYYYMMDD / 100 = YYYYMM
@@ -292,7 +290,9 @@ pub fn spending_by_category(
          LEFT JOIN categories c ON c.id = t.category AND c.tombstone = 0
          LEFT JOIN category_groups cg ON cg.id = c.cat_group AND cg.tombstone = 0
          WHERE t.tombstone = 0
-           AND (t.is_child = 0 OR t.is_child IS NULL)
+           -- Split categories live on child rows (parent holds the total with a
+           -- NULL category); exclude parents and keep children for per-category sums.
+           AND (t.is_parent = 0 OR t.is_parent IS NULL)
            AND t.amount < 0
            AND t.date >= ?1 AND t.date <= ?2
          GROUP BY c.id
@@ -366,6 +366,9 @@ mod tests {
                 transfer_acct TEXT,
                 tombstone INTEGER DEFAULT 0
              );
+             CREATE TABLE payee_mapping (
+                id TEXT, targetId TEXT
+             );
              CREATE TABLE transactions (
                 id TEXT, acct TEXT,
                 date INTEGER, amount INTEGER,
@@ -373,10 +376,15 @@ mod tests {
                 cleared INTEGER DEFAULT 0,
                 reconciled INTEGER DEFAULT 0,
                 tombstone INTEGER DEFAULT 0,
-                is_child INTEGER DEFAULT 0
+                is_child INTEGER DEFAULT 0,
+                is_parent INTEGER DEFAULT 0
              );
+             -- Both budget tables always exist; month is an INTEGER (YYYYMM).
              CREATE TABLE zero_budgets (
-                id TEXT, month TEXT, category TEXT, amount INTEGER
+                id TEXT, month INTEGER, category TEXT, amount INTEGER
+             );
+             CREATE TABLE reflect_budgets (
+                id TEXT, month INTEGER, category TEXT, amount INTEGER
              );
 
              -- Accounts
@@ -386,17 +394,19 @@ mod tests {
              INSERT INTO category_groups VALUES ('grp1','Bills',0,0,0,1);
              INSERT INTO categories VALUES ('cat1','Groceries','grp1',0,0,0,1);
              INSERT INTO categories VALUES ('cat2','Utilities','grp1',0,0,0,2);
-             -- Payees
+             -- Payees + self-mappings
              INSERT INTO payees VALUES ('pay1','Grocery Store',NULL,0);
              INSERT INTO payees VALUES ('pay2','Electric Co',NULL,0);
-             -- Transactions (amounts in cents: 100 = $1.00)
-             INSERT INTO transactions VALUES ('t1','acc1',20240115,-5000,'pay1','weekly shop','cat1',1,0,0,0);
-             INSERT INTO transactions VALUES ('t2','acc1',20240120,-2000,'pay2',NULL,'cat2',1,0,0,0);
-             INSERT INTO transactions VALUES ('t3','acc1',20240201,100000,NULL,'salary',NULL,1,0,0,0);
-             INSERT INTO transactions VALUES ('t4','acc2',20240115,-3000,'pay1',NULL,'cat1',0,0,0,0);
-             -- Budget for 2024-01
-             INSERT INTO zero_budgets VALUES ('zb1','2024-01','cat1',60000);
-             INSERT INTO zero_budgets VALUES ('zb2','2024-01','cat2',10000);",
+             INSERT INTO payee_mapping VALUES ('pay1','pay1');
+             INSERT INTO payee_mapping VALUES ('pay2','pay2');
+             -- Transactions (amounts in cents: 100 = $1.00); trailing cols: tombstone, is_child, is_parent
+             INSERT INTO transactions VALUES ('t1','acc1',20240115,-5000,'pay1','weekly shop','cat1',1,0,0,0,0);
+             INSERT INTO transactions VALUES ('t2','acc1',20240120,-2000,'pay2',NULL,'cat2',1,0,0,0,0);
+             INSERT INTO transactions VALUES ('t3','acc1',20240201,100000,NULL,'salary',NULL,1,0,0,0,0);
+             INSERT INTO transactions VALUES ('t4','acc2',20240115,-3000,'pay1',NULL,'cat1',0,0,0,0,0);
+             -- Budget for 2024-01 (stored as integer 202401)
+             INSERT INTO zero_budgets VALUES ('zb1',202401,'cat1',60000);
+             INSERT INTO zero_budgets VALUES ('zb2',202401,'cat2',10000);",
         )
         .expect("schema");
         drop(conn);
@@ -458,7 +468,8 @@ mod tests {
     #[test]
     fn get_budget_month_totals() {
         let db = test_db();
-        let bm = get_budget_month(db.path(), "2024-01").unwrap();
+        let (start, end) = month_bounds("2024-01").unwrap();
+        let bm = get_budget_month(db.path(), "2024-01", start, end).unwrap();
         assert_eq!(bm.month, "2024-01");
         // Both categories have data
         assert_eq!(bm.categories.len(), 2);
@@ -471,7 +482,9 @@ mod tests {
     #[test]
     fn monthly_summary_sums_correctly() {
         let db = test_db();
-        let summary = monthly_summary(db.path(), "2024-01", "2024-02").unwrap();
+        let (start, _) = month_bounds("2024-01").unwrap();
+        let (_, end) = month_bounds("2024-02").unwrap();
+        let summary = monthly_summary(db.path(), start, end).unwrap();
         assert!(!summary.is_empty());
         let jan = summary.iter().find(|m| m.month == "2024-01").unwrap();
         assert_eq!(jan.income_cents, 0);
@@ -501,19 +514,23 @@ mod tests {
                 id TEXT, acct TEXT, date INTEGER, amount INTEGER,
                 description TEXT, notes TEXT, category TEXT,
                 cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
-                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0
+                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
+                is_parent INTEGER DEFAULT 0
              );
              -- month column stores INTEGER values as Actual Budget does in production
              CREATE TABLE zero_budgets (
+                id TEXT, month INTEGER, category TEXT, amount INTEGER
+             );
+             CREATE TABLE reflect_budgets (
                 id TEXT, month INTEGER, category TEXT, amount INTEGER
              );
              INSERT INTO category_groups VALUES ('grp1','Bills',0,0,0,1);
              INSERT INTO categories VALUES ('cat1','Groceries','grp1',0,0,0,1);
              INSERT INTO categories VALUES ('cat2','Utilities','grp1',0,0,0,2);
              INSERT INTO transactions VALUES
-                 ('t1','acc1',20240115,-5000,'pay1','shop','cat1',1,0,0,0);
+                 ('t1','acc1',20240115,-5000,'pay1','shop','cat1',1,0,0,0,0);
              INSERT INTO transactions VALUES
-                 ('t2','acc1',20240120,-2000,'pay2',NULL,'cat2',1,0,0,0);
+                 ('t2','acc1',20240120,-2000,'pay2',NULL,'cat2',1,0,0,0,0);
              INSERT INTO zero_budgets VALUES ('zb1',202401,'cat1',60000);
              INSERT INTO zero_budgets VALUES ('zb2',202401,'cat2',10000);",
         )
@@ -525,7 +542,8 @@ mod tests {
     #[test]
     fn get_budget_month_with_integer_month_storage() {
         let db = test_db_int_months();
-        let bm = get_budget_month(db.path(), "2024-01").unwrap();
+        let (start, end) = month_bounds("2024-01").unwrap();
+        let bm = get_budget_month(db.path(), "2024-01", start, end).unwrap();
         assert_eq!(bm.month, "2024-01");
         assert_eq!(bm.categories.len(), 2);
         let groceries = bm
@@ -570,10 +588,183 @@ mod tests {
     #[test]
     fn get_budget_month_includes_cents_totals() {
         let db = test_db();
-        let bm = get_budget_month(db.path(), "2024-01").unwrap();
+        let (start, end) = month_bounds("2024-01").unwrap();
+        let bm = get_budget_month(db.path(), "2024-01", start, end).unwrap();
         // Verify cents totals are present and consistent with display values
         assert_eq!(bm.total_budgeted_cents, bm.categories.iter().map(|c| c.budgeted_cents).sum::<i64>());
         assert_eq!(bm.total_spent_cents, bm.categories.iter().map(|c| c.spent_cents).sum::<i64>());
         assert_eq!(bm.total_balance_cents, bm.total_budgeted_cents + bm.total_spent_cents);
+    }
+
+    /// A budget with one normal transaction plus a split (parent + two children).
+    /// Mirrors Actual: the parent (is_parent=1) holds the total with a NULL
+    /// category; each child (is_child=1) carries its own category and amount.
+    fn test_db_splits() -> NamedTempFile {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let conn = Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE accounts (
+                id TEXT, name TEXT, type TEXT, offbudget INTEGER DEFAULT 0,
+                closed INTEGER DEFAULT 0, tombstone INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE category_groups (
+                id TEXT, name TEXT, is_income INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0, tombstone INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE categories (
+                id TEXT, name TEXT, cat_group TEXT, is_income INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0, tombstone INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE transactions (
+                id TEXT, acct TEXT, date INTEGER, amount INTEGER,
+                description TEXT, notes TEXT, category TEXT,
+                cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
+                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
+                is_parent INTEGER DEFAULT 0
+             );
+             CREATE TABLE zero_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
+             CREATE TABLE reflect_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
+
+             INSERT INTO accounts VALUES ('acc1','Checking','checking',0,0,0,1);
+             INSERT INTO category_groups VALUES ('grp1','Bills',0,0,0,1);
+             INSERT INTO categories VALUES ('cat1','Groceries','grp1',0,0,0,1);
+             INSERT INTO categories VALUES ('cat2','Utilities','grp1',0,0,0,2);
+             -- trailing cols: tombstone, is_child, is_parent
+             -- Normal transaction
+             INSERT INTO transactions VALUES ('n1','acc1',20240115,-1000,NULL,NULL,'cat1',1,0,0,0,0);
+             -- Split: parent total -5000, NULL category, is_parent=1
+             INSERT INTO transactions VALUES ('p1','acc1',20240116,-5000,NULL,NULL,NULL,1,0,0,0,1);
+             -- Split children carry the categorized amounts, is_child=1
+             INSERT INTO transactions VALUES ('c1','acc1',20240116,-2000,NULL,NULL,'cat1',1,0,0,1,0);
+             INSERT INTO transactions VALUES ('c2','acc1',20240116,-3000,NULL,NULL,'cat2',1,0,0,1,0);
+             INSERT INTO zero_budgets VALUES ('zb1',202401,'cat1',60000);
+             INSERT INTO zero_budgets VALUES ('zb2',202401,'cat2',10000);",
+        )
+        .expect("schema");
+        drop(conn);
+        tmp
+    }
+
+    #[test]
+    fn spending_by_category_counts_split_children_not_parent() {
+        let db = test_db_splits();
+        let spending = spending_by_category(db.path(), 20240101, 20240131).unwrap();
+        // Categorized spend lives on children + normal rows; the split parent
+        // (NULL category, -5000) must NOT appear as an "Uncategorized" row.
+        assert!(
+            !spending.iter().any(|s| s.category_name == "Uncategorized"),
+            "split parent should be excluded, not surface as Uncategorized"
+        );
+        let groceries = spending.iter().find(|s| s.category_name == "Groceries").unwrap();
+        // n1 (-1000) + c1 (-2000)
+        assert_eq!(groceries.total_cents, -3000);
+        let utilities = spending.iter().find(|s| s.category_name == "Utilities").unwrap();
+        // c2 (-3000)
+        assert_eq!(utilities.total_cents, -3000);
+    }
+
+    #[test]
+    fn get_budget_month_counts_split_children() {
+        let db = test_db_splits();
+        let (start, end) = month_bounds("2024-01").unwrap();
+        let bm = get_budget_month(db.path(), "2024-01", start, end).unwrap();
+        let groceries = bm.categories.iter().find(|c| c.category_name == "Groceries").unwrap();
+        assert_eq!(groceries.spent_cents, -3000); // n1 + c1
+        let utilities = bm.categories.iter().find(|c| c.category_name == "Utilities").unwrap();
+        assert_eq!(utilities.spent_cents, -3000); // c2
+    }
+
+    #[test]
+    fn balances_count_split_parent_not_children() {
+        // Account balance / net worth must count the parent total once and skip
+        // the children, to avoid double-counting the split.
+        let db = test_db_splits();
+        let accounts = list_accounts(db.path()).unwrap();
+        let acc1 = accounts.iter().find(|a| a.id == "acc1").unwrap();
+        // n1 (-1000) + parent p1 (-5000); children excluded.
+        assert_eq!(acc1.balance_cents, -6000);
+        assert_eq!(net_worth(db.path()).unwrap(), -6000);
+    }
+
+    /// Tracking budgets store amounts in reflect_budgets rather than zero_budgets.
+    fn test_db_tracking_budget() -> NamedTempFile {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let conn = Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE category_groups (
+                id TEXT, name TEXT, is_income INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0, tombstone INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE categories (
+                id TEXT, name TEXT, cat_group TEXT, is_income INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0, tombstone INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0
+             );
+             CREATE TABLE transactions (
+                id TEXT, acct TEXT, date INTEGER, amount INTEGER,
+                description TEXT, notes TEXT, category TEXT,
+                cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
+                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
+                is_parent INTEGER DEFAULT 0
+             );
+             CREATE TABLE zero_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
+             CREATE TABLE reflect_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
+             INSERT INTO category_groups VALUES ('grp1','Bills',0,0,0,1);
+             INSERT INTO categories VALUES ('cat1','Groceries','grp1',0,0,0,1);
+             -- Budget lives only in reflect_budgets (tracking mode).
+             INSERT INTO reflect_budgets VALUES ('rb1',202401,'cat1',45000);",
+        )
+        .expect("schema");
+        drop(conn);
+        tmp
+    }
+
+    #[test]
+    fn get_budget_month_reads_tracking_budget_table() {
+        let db = test_db_tracking_budget();
+        let (start, end) = month_bounds("2024-01").unwrap();
+        let bm = get_budget_month(db.path(), "2024-01", start, end).unwrap();
+        let groceries = bm.categories.iter().find(|c| c.category_name == "Groceries").unwrap();
+        assert_eq!(groceries.budgeted_cents, 45000);
+    }
+
+    /// A transaction whose description points at a merged-away payee should
+    /// resolve to the surviving payee's name via payee_mapping.
+    fn test_db_merged_payee() -> NamedTempFile {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let conn = Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE payees (id TEXT, name TEXT, transfer_acct TEXT, tombstone INTEGER DEFAULT 0);
+             CREATE TABLE payee_mapping (id TEXT, targetId TEXT);
+             CREATE TABLE categories (id TEXT, name TEXT, cat_group TEXT, tombstone INTEGER DEFAULT 0);
+             CREATE TABLE transactions (
+                id TEXT, acct TEXT, date INTEGER, amount INTEGER,
+                description TEXT, notes TEXT, category TEXT,
+                cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
+                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
+                is_parent INTEGER DEFAULT 0
+             );
+             -- 'old' was merged into 'keep' and tombstoned; mapping redirects it.
+             INSERT INTO payees VALUES ('keep','Grocery Store',NULL,0);
+             INSERT INTO payees VALUES ('old','Old Grocery',NULL,1);
+             INSERT INTO payee_mapping VALUES ('keep','keep');
+             INSERT INTO payee_mapping VALUES ('old','keep');
+             INSERT INTO transactions VALUES ('t1','acc1',20240115,-5000,'old',NULL,NULL,1,0,0,0,0);",
+        )
+        .expect("schema");
+        drop(conn);
+        tmp
+    }
+
+    #[test]
+    fn get_transactions_resolves_merged_payee() {
+        let db = test_db_merged_payee();
+        let txns = get_transactions(db.path(), None, None, None, 500).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].payee, "Grocery Store");
     }
 }
