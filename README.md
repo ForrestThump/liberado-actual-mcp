@@ -117,6 +117,7 @@ Or for a running HTTP server:
 | `ACTUAL_PASSWORD` | Server mode | Server password |
 | `ACTUAL_BUDGET_ID` | Server mode | Budget sync ID (uses first if omitted) |
 | `BIND_ADDR` | No | Enables HTTP transport on this address; binary defaults to STDIO when unset (Docker image sets `0.0.0.0:8000`) |
+| `ACTUAL_CURRENCY_SYMBOL` | No | Currency symbol prefix used in display amounts (default: `$`) |
 
 ---
 

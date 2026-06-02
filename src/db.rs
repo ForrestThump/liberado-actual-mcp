@@ -161,6 +161,11 @@ pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result
         }
     };
 
+    // Normalise the month to an integer (202401) so the JOIN works regardless
+    // of whether zero_budgets.month is stored as TEXT "2024-01" or INTEGER 202401.
+    // CAST(REPLACE(col, '-', '') AS INTEGER) converts both forms to 202401.
+    let month_int: i64 = month.replace('-', "").parse().unwrap_or(0);
+
     let conn = open(path)?;
 
     let mut stmt = conn.prepare(
@@ -171,7 +176,7 @@ pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result
          LEFT JOIN category_groups cg ON cg.id = c.cat_group AND cg.tombstone = 0
          LEFT JOIN zero_budgets zb
                ON zb.category = c.id
-              AND (zb.month = ?1 OR zb.month = CAST(REPLACE(?1, '-', '') AS INTEGER))
+              AND CAST(REPLACE(zb.month, '-', '') AS INTEGER) = ?1
          LEFT JOIN (
              SELECT category, SUM(amount) AS spent
              FROM transactions
@@ -185,7 +190,7 @@ pub fn get_budget_month(path: &std::path::Path, month: &str) -> rusqlite::Result
     )?;
 
     let cats: Vec<BudgetCategory> = stmt
-        .query_map(params![month, start, end], |row| {
+        .query_map(params![month_int, start, end], |row| {
             let budgeted: i64 = row.get(3)?;
             let spent: i64 = row.get(4)?;
             let balance = budgeted + spent; // spent is negative for expenses
@@ -296,7 +301,8 @@ pub fn spending_by_category(
            AND t.amount < 0
            AND t.date >= ?1 AND t.date <= ?2
          GROUP BY c.id
-         ORDER BY total ASC",
+         ORDER BY total ASC
+         LIMIT 500",
     )?;
 
     let rows = stmt.query_map(params![start_date, end_date], |row| {

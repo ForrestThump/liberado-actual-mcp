@@ -121,16 +121,26 @@ pub struct CategorySpending {
 
 // ── Amount formatting ────────────────────────────────────────────────────────
 
+fn currency_symbol() -> &'static str {
+    use std::sync::OnceLock;
+    static SYM: OnceLock<String> = OnceLock::new();
+    SYM.get_or_init(|| {
+        std::env::var("ACTUAL_CURRENCY_SYMBOL").unwrap_or_else(|_| "$".to_string())
+    })
+}
+
 // Actual Budget stores monetary values as integer cents (100 = $1.00).
+// Set ACTUAL_CURRENCY_SYMBOL to override the default "$" prefix.
 pub fn format_amount(cents: i64) -> String {
+    let sym = currency_symbol();
     let negative = cents < 0;
     let abs = cents.unsigned_abs();
     let dollars = abs / 100;
     let rem = abs % 100;
     if negative {
-        format!("-${dollars}.{rem:02}")
+        format!("-{sym}{dollars}.{rem:02}")
     } else {
-        format!("${dollars}.{rem:02}")
+        format!("{sym}{dollars}.{rem:02}")
     }
 }
 
