@@ -13,7 +13,7 @@ fn check_response<T>(resp: ApiResponse<T>, context: &str) -> anyhow::Result<T> {
 
 pub struct ActualClient {
     client: Client,
-    pub server_url: String,
+    server_url: String,
 }
 
 impl ActualClient {
@@ -22,7 +22,7 @@ impl ActualClient {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()?,
-            server_url,
+            server_url: server_url.trim_end_matches('/').to_string(),
         })
     }
 
@@ -137,5 +137,17 @@ mod tests {
     fn sqlite_magic_rejects_encrypted() {
         let encrypted = b"\xde\xad\xbe\xef\x00\x01\x02\x03other bytes";
         assert!(!encrypted.starts_with(SQLITE_MAGIC));
+    }
+
+    #[test]
+    fn new_trims_trailing_slash() {
+        let client = ActualClient::new("http://localhost:5006/".to_string()).unwrap();
+        assert_eq!(client.server_url, "http://localhost:5006");
+    }
+
+    #[test]
+    fn new_trims_multiple_trailing_slashes() {
+        let client = ActualClient::new("http://localhost:5006///".to_string()).unwrap();
+        assert_eq!(client.server_url, "http://localhost:5006");
     }
 }
