@@ -48,6 +48,7 @@ pub fn get_transactions(
     max_amount: Option<i64>,
     category: Option<&str>,
     payee: Option<&str>,
+    notes: Option<&str>,
 ) -> rusqlite::Result<Vec<Transaction>> {
     let conn = open(path)?;
 
@@ -73,12 +74,13 @@ pub fn get_transactions(
            AND (?6 IS NULL OR t.amount <= ?6)
            AND (?7 IS NULL OR c.id = ?7 OR LOWER(c.name) = LOWER(?7))
            AND (?8 IS NULL OR INSTR(LOWER(COALESCE(p.name, '')), LOWER(?8)) > 0)
+           AND (?9 IS NULL OR INSTR(LOWER(COALESCE(t.notes, '')), LOWER(?9)) > 0)
          ORDER BY t.date DESC, t.id
          LIMIT ?4",
     )?;
 
     let rows = stmt.query_map(
-        params![account_id, start_date, end_date, limit, min_amount, max_amount, category, payee],
+        params![account_id, start_date, end_date, limit, min_amount, max_amount, category, payee, notes],
         |row| {
             let raw_date: i64 = row.get(1)?;
             let amount: i64 = row.get(2)?;
@@ -323,6 +325,93 @@ pub fn spending_by_category(
     rows.collect()
 }
 
+/// Aggregate spending (negative-amount transactions) by resolved payee name
+/// between `start_date` and `end_date` (YYYYMMDD, inclusive).
+/// Split transactions are counted via the parent row so each purchase is
+/// attributed to its payee exactly once. Results are ordered most-spent first.
+pub fn spending_by_payee(
+    path: &std::path::Path,
+    start_date: i64,
+    end_date: i64,
+) -> rusqlite::Result<Vec<PayeeSpending>> {
+    let conn = open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(p.name, 'No Payee') AS payee_name,
+                SUM(t.amount) AS total,
+                COUNT(*) AS cnt
+         FROM transactions t
+         LEFT JOIN payee_mapping pm ON pm.id = t.description
+         LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
+         WHERE t.tombstone = 0
+           -- Use non-child rows: regular transactions + split parents.
+           -- This attributes the full split amount to its payee without
+           -- double-counting via child rows.
+           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND t.amount < 0
+           AND t.date >= ?1 AND t.date <= ?2
+         GROUP BY COALESCE(pm.targetId, t.description)
+         ORDER BY total ASC",
+    )?;
+    let rows = stmt.query_map(params![start_date, end_date], |row| {
+        let total: i64 = row.get(1)?;
+        Ok(PayeeSpending {
+            payee_name: row.get(0)?,
+            total_cents: total,
+            total_display: format_amount(total),
+            transaction_count: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Return transactions that have no category assigned.
+/// Split parent rows (is_parent=1) are excluded because their NULL category
+/// is intentional — the real categories live on their child rows.
+pub fn uncategorized_transactions(
+    path: &std::path::Path,
+    account_id: Option<&str>,
+    start_date: Option<i64>,
+    end_date: Option<i64>,
+    limit: i64,
+) -> rusqlite::Result<Vec<Transaction>> {
+    let conn = open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.date, t.amount,
+                COALESCE(p.name, ''),
+                COALESCE(t.notes, ''),
+                COALESCE(t.cleared, 0),
+                COALESCE(t.reconciled, 0)
+         FROM transactions t
+         LEFT JOIN payee_mapping pm ON pm.id = t.description
+         LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
+         WHERE t.tombstone = 0
+           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND (t.is_parent = 0 OR t.is_parent IS NULL)
+           AND t.category IS NULL
+           AND (?1 IS NULL OR t.acct = ?1)
+           AND (?2 IS NULL OR t.date >= ?2)
+           AND (?3 IS NULL OR t.date <= ?3)
+         ORDER BY t.date DESC, t.id
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(params![account_id, start_date, end_date, limit], |row| {
+        let raw_date: i64 = row.get(1)?;
+        let amount: i64 = row.get(2)?;
+        Ok(Transaction {
+            id: row.get(0)?,
+            date: date_int_to_str(raw_date),
+            amount_cents: amount,
+            amount_display: format_amount(amount),
+            payee: row.get(3)?,
+            category: String::new(),
+            notes: row.get(4)?,
+            cleared: row.get::<_, i64>(5)? != 0,
+            reconciled: row.get::<_, i64>(6)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
 /// Returns the running end-of-month balance for an account (or all accounts when
 /// `account_id` is None) for each month that has transactions in the range
 /// [`start_ym`, `end_ym`] where values are YYYYMM integers.
@@ -520,7 +609,7 @@ mod tests {
     #[test]
     fn get_transactions_all_accounts() {
         let db = test_db();
-        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, None, None).unwrap();
         // 4 non-child transactions inserted
         assert_eq!(txns.len(), 4);
     }
@@ -528,7 +617,7 @@ mod tests {
     #[test]
     fn get_transactions_filter_by_account() {
         let db = test_db();
-        let txns = get_transactions(db.path(), Some("acc2"), None, None, 500, None, None, None, None).unwrap();
+        let txns = get_transactions(db.path(), Some("acc2"), None, None, 500, None, None, None, None, None).unwrap();
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].amount_cents, -3000);
     }
@@ -537,7 +626,7 @@ mod tests {
     fn get_transactions_filter_by_date() {
         let db = test_db();
         let txns =
-            get_transactions(db.path(), None, Some(20240201), Some(20240228), 500, None, None, None, None).unwrap();
+            get_transactions(db.path(), None, Some(20240201), Some(20240228), 500, None, None, None, None, None).unwrap();
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].date, "2024-02-01");
     }
@@ -664,7 +753,7 @@ mod tests {
         // Previously "" was a sentinel that disabled the account filter, returning
         // all transactions. Now it's treated as a literal (non-matching) value.
         let db = test_db();
-        let txns = get_transactions(db.path(), Some(""), None, None, 500, None, None, None, None).unwrap();
+        let txns = get_transactions(db.path(), Some(""), None, None, 500, None, None, None, None, None).unwrap();
         assert_eq!(txns.len(), 0, "empty account_id should match no accounts");
     }
 
@@ -672,7 +761,7 @@ mod tests {
     fn get_transactions_filter_by_min_amount() {
         let db = test_db();
         // min -2000 includes t2 (-2000) and t3 (100000) but not t1 (-5000) or t4 (-3000)
-        let txns = get_transactions(db.path(), None, None, None, 500, Some(-2000), None, None, None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, Some(-2000), None, None, None, None).unwrap();
         assert_eq!(txns.len(), 2);
         assert!(txns.iter().all(|t| t.amount_cents >= -2000));
     }
@@ -681,7 +770,7 @@ mod tests {
     fn get_transactions_filter_by_max_amount() {
         let db = test_db();
         // max -2000 includes only the expenses <= -2000: t1 (-5000), t2 (-2000), t4 (-3000)
-        let txns = get_transactions(db.path(), None, None, None, 500, None, Some(-2000), None, None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, None, Some(-2000), None, None, None).unwrap();
         assert_eq!(txns.len(), 3);
         assert!(txns.iter().all(|t| t.amount_cents <= -2000));
     }
@@ -689,7 +778,7 @@ mod tests {
     #[test]
     fn get_transactions_filter_by_category_name() {
         let db = test_db();
-        let txns = get_transactions(db.path(), None, None, None, 500, None, None, Some("Groceries"), None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, None, None, Some("Groceries"), None, None).unwrap();
         assert_eq!(txns.len(), 2); // t1 and t4
         assert!(txns.iter().all(|t| t.category == "Groceries"));
     }
@@ -697,7 +786,7 @@ mod tests {
     #[test]
     fn get_transactions_filter_by_category_id() {
         let db = test_db();
-        let txns = get_transactions(db.path(), None, None, None, 500, None, None, Some("cat1"), None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, None, None, Some("cat1"), None, None).unwrap();
         assert_eq!(txns.len(), 2); // t1 and t4
     }
 
@@ -705,11 +794,11 @@ mod tests {
     fn get_transactions_filter_by_payee_partial() {
         let db = test_db();
         // "Grocery" matches "Grocery Store"
-        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, Some("Grocery")).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, Some("Grocery"), None).unwrap();
         assert_eq!(txns.len(), 2); // t1 and t4
 
         // "Electric" matches "Electric Co"
-        let txns2 = get_transactions(db.path(), None, None, None, 500, None, None, None, Some("Electric")).unwrap();
+        let txns2 = get_transactions(db.path(), None, None, None, 500, None, None, None, Some("Electric"), None).unwrap();
         assert_eq!(txns2.len(), 1); // t2
     }
 
@@ -763,6 +852,8 @@ mod tests {
                 tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
                 is_parent INTEGER DEFAULT 0
              );
+             CREATE TABLE payees (id TEXT, name TEXT, transfer_acct TEXT, tombstone INTEGER DEFAULT 0);
+             CREATE TABLE payee_mapping (id TEXT, targetId TEXT);
              CREATE TABLE zero_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
              CREATE TABLE reflect_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
 
@@ -901,7 +992,7 @@ mod tests {
     #[test]
     fn get_transactions_resolves_merged_payee() {
         let db = test_db_merged_payee();
-        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, None).unwrap();
+        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, None, None).unwrap();
         assert_eq!(txns.len(), 1);
         assert_eq!(txns[0].payee, "Grocery Store");
     }
@@ -990,5 +1081,65 @@ mod tests {
         let null_stage_rule = rules.iter().find(|r| r.id == "rule2").unwrap();
         assert_eq!(null_stage_rule.stage, None);
         assert_eq!(null_stage_rule.conditions_op, "or");
+    }
+
+    #[test]
+    fn get_transactions_filter_by_notes() {
+        let db = test_db();
+        // t1 has notes "weekly shop", t3 has notes "salary"; t2 and t4 have no notes
+        let txns = get_transactions(db.path(), None, None, None, 500, None, None, None, None, Some("shop")).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].id, "t1");
+
+        let txns2 = get_transactions(db.path(), None, None, None, 500, None, None, None, None, Some("SALARY")).unwrap();
+        assert_eq!(txns2.len(), 1);
+        assert_eq!(txns2[0].id, "t3");
+
+        // Non-matching notes returns empty
+        let txns3 = get_transactions(db.path(), None, None, None, 500, None, None, None, None, Some("zzz")).unwrap();
+        assert_eq!(txns3.len(), 0);
+    }
+
+    #[test]
+    fn spending_by_payee_sums_and_orders() {
+        let db = test_db();
+        // Jan: t1 pay1 -5000, t2 pay2 -2000, t4 pay1 -3000; t3 is income (+100000), skipped
+        let spending = spending_by_payee(db.path(), 20240101, 20240131).unwrap();
+        assert_eq!(spending.len(), 2);
+        // Ordered most-spent first (most negative total first)
+        let grocery = spending.iter().find(|s| s.payee_name == "Grocery Store").unwrap();
+        assert_eq!(grocery.total_cents, -8000); // t1 + t4
+        assert_eq!(grocery.transaction_count, 2);
+        let electric = spending.iter().find(|s| s.payee_name == "Electric Co").unwrap();
+        assert_eq!(electric.total_cents, -2000);
+    }
+
+    #[test]
+    fn uncategorized_transactions_excludes_split_parents() {
+        let db = test_db_splits();
+        // p1 is a split parent (is_parent=1, category=NULL) — must be excluded
+        // n1 has category cat1 — not uncategorized
+        // c1 and c2 are children (is_child=1) — excluded
+        // No remaining regular uncategorized rows → empty result
+        let txns = uncategorized_transactions(db.path(), None, None, None, 500).unwrap();
+        assert_eq!(txns.len(), 0, "split parent with NULL category must not appear");
+    }
+
+    #[test]
+    fn uncategorized_transactions_returns_uncategorized() {
+        // t3 (salary) has no category; t1, t2, t4 are categorized
+        let db = test_db();
+        let txns = uncategorized_transactions(db.path(), None, None, None, 500).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].id, "t3");
+        assert_eq!(txns[0].category, "");
+    }
+
+    #[test]
+    fn uncategorized_transactions_filters_by_account() {
+        let db = test_db();
+        // acc2 only has t4 which IS categorized; no uncategorized transactions in acc2
+        let txns = uncategorized_transactions(db.path(), Some("acc2"), None, None, 500).unwrap();
+        assert_eq!(txns.len(), 0);
     }
 }

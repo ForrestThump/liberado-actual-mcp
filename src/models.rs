@@ -120,6 +120,14 @@ pub struct CategorySpending {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PayeeSpending {
+    pub payee_name: String,
+    pub total_cents: i64,
+    pub total_display: String,
+    pub transaction_count: i64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct BalanceHistoryEntry {
     pub month: String,
     pub net_change_cents: i64,

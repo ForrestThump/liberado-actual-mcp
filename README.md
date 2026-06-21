@@ -8,17 +8,37 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 
 ## Tools
 
+### Read tools
+
 | Tool | Description |
 |---|---|
 | `list_accounts` | All accounts with current balances |
-| `get_transactions` | Transaction history; filter by account and/or date range |
+| `get_transactions` | Transaction history with optional filters (see below) |
 | `list_categories` | Category groups and categories |
 | `list_payees` | All payees |
 | `get_budget_month` | Budgeted vs. actual spending by category for a month |
-| `monthly_summary` | Income, expenses, net savings per month |
-| `spending_by_category` | Expense totals by category for a date range |
+| `monthly_summary` | Income, expenses, net savings per month over a range |
+| `spending_by_category` | Expense totals grouped by category for a date range |
+| `spending_by_payee` | Expense totals grouped by payee for a date range |
+| `uncategorized_transactions` | Transactions with no category (excludes split parents) |
+| `balance_history` | Month-by-month running account balance |
 | `net_worth` | Total balance across all on-budget accounts |
-| `refresh` | Re-download latest budget data from server |
+| `get_rules` | Auto-categorisation rules with parsed conditions and actions |
+| `refresh` | Re-download latest budget data from server (server mode only) |
+
+### `get_transactions` parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `account_id` | string? | Filter to one account (omit for all) |
+| `start_date` | string? | Earliest date, `YYYY-MM-DD` |
+| `end_date` | string? | Latest date, `YYYY-MM-DD` |
+| `limit` | integer? | Max rows returned (default 500, max 2000) |
+| `min_amount_cents` | integer? | Minimum amount in cents, inclusive (negative = expense; e.g. `-5000` = -$50.00) |
+| `max_amount_cents` | integer? | Maximum amount in cents, inclusive |
+| `category` | string? | Exact match by category name or id (case-insensitive) |
+| `payee` | string? | Partial match on payee name (case-insensitive) |
+| `notes` | string? | Partial match on memo/notes text (case-insensitive) |
 
 ---
 
