@@ -119,6 +119,24 @@ pub struct CategorySpending {
     pub transaction_count: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct BalanceHistoryEntry {
+    pub month: String,
+    pub net_change_cents: i64,
+    pub net_change_display: String,
+    pub balance_cents: i64,
+    pub balance_display: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Rule {
+    pub id: String,
+    pub stage: Option<String>,
+    pub conditions_op: String,
+    pub conditions: serde_json::Value,
+    pub actions: serde_json::Value,
+}
+
 // ── Amount formatting ────────────────────────────────────────────────────────
 
 // Actual Budget stores monetary values as integer cents (100 = $1.00).
@@ -153,6 +171,20 @@ pub fn date_str_to_int(s: &str) -> Option<i64> {
     let d: i64 = parts[2].parse().ok()?;
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
     Some(y * 10000 + m * 100 + d)
+}
+
+// Convert "YYYY-MM" to an integer YYYYMM (e.g. "2024-03" → 202403).
+pub fn month_to_ym(month: &str) -> Option<i64> {
+    let parts: Vec<&str> = month.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    Some(y * 100 + m)
 }
 
 // First and last day of month as YYYYMMDD integers, given "YYYY-MM".
@@ -231,5 +263,20 @@ mod tests {
         // Out-of-range months are rejected
         assert_eq!(month_bounds("2024-00"), None);
         assert_eq!(month_bounds("2024-13"), None);
+    }
+
+    #[test]
+    fn month_to_ym_valid() {
+        assert_eq!(month_to_ym("2024-01"), Some(202401));
+        assert_eq!(month_to_ym("2024-12"), Some(202412));
+        assert_eq!(month_to_ym("2000-06"), Some(200006));
+    }
+
+    #[test]
+    fn month_to_ym_invalid() {
+        assert_eq!(month_to_ym("2024"), None);
+        assert_eq!(month_to_ym("not-valid"), None);
+        assert_eq!(month_to_ym("2024-00"), None);
+        assert_eq!(month_to_ym("2024-13"), None);
     }
 }
