@@ -6,7 +6,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::{
     actual::{find_budget_file, ActualClient, SQLITE_MAGIC},
     db,
-    models::{date_str_to_int, format_amount, month_bounds},
+    models::{date_str_to_int, format_amount, month_bounds, month_to_ym},
 };
 
 fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
@@ -213,13 +213,23 @@ impl ActualServer {
 
     #[tool("Get transactions for an account. account_id is optional (omit for all accounts). \
             start_date and end_date are optional ISO dates (YYYY-MM-DD). \
-            limit caps the number returned (default 500, max 2000).")]
+            limit caps the number returned (default 500, max 2000). \
+            min_amount_cents and max_amount_cents filter by amount in cents \
+            (e.g. max_amount_cents=-1 returns only expenses; amounts are negative for debits). \
+            category filters by category name or id (exact match, case-insensitive). \
+            payee filters by payee name (partial, case-insensitive). \
+            notes filters by memo/notes text (partial, case-insensitive).")]
     async fn get_transactions(
         &self,
         account_id: Option<String>,
         start_date: Option<String>,
         end_date: Option<String>,
         limit: Option<i64>,
+        min_amount_cents: Option<i64>,
+        max_amount_cents: Option<i64>,
+        category: Option<String>,
+        payee: Option<String>,
+        notes: Option<String>,
     ) -> McpResult<String> {
         let start = start_date
             .as_deref()
@@ -240,7 +250,20 @@ impl ActualServer {
         let limit = limit.unwrap_or(500).clamp(1, 2000);
         json_result(
             &self
-                .query(move |p| db::get_transactions(p, account_id.as_deref(), start, end, limit))
+                .query(move |p| {
+                    db::get_transactions(
+                        p,
+                        account_id.as_deref(),
+                        start,
+                        end,
+                        limit,
+                        min_amount_cents,
+                        max_amount_cents,
+                        category.as_deref(),
+                        payee.as_deref(),
+                        notes.as_deref(),
+                    )
+                })
                 .await?,
         )
     }
@@ -321,5 +344,106 @@ impl ActualServer {
     async fn net_worth(&self) -> McpResult<String> {
         let total = self.query(db::net_worth).await?;
         Ok(format!("Net worth (on-budget accounts): {}", format_amount(total)))
+    }
+
+    #[tool("Get the month-by-month running balance for an account. \
+            account_id is optional (omit to aggregate across all accounts, including off-budget). \
+            start_month and end_month use YYYY-MM format. \
+            balance_cents reflects the true cumulative balance from account opening, \
+            not just from start_month. Months with no transactions are omitted.")]
+    async fn balance_history(
+        &self,
+        account_id: Option<String>,
+        start_month: String,
+        end_month: String,
+    ) -> McpResult<String> {
+        let start_ym = month_to_ym(&start_month).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid start_month '{start_month}'; expected YYYY-MM"
+            ))
+        })?;
+        let end_ym = month_to_ym(&end_month).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid end_month '{end_month}'; expected YYYY-MM"
+            ))
+        })?;
+        json_result(
+            &self
+                .query(move |p| db::balance_history(p, account_id.as_deref(), start_ym, end_ym))
+                .await?,
+        )
+    }
+
+    #[tool("List all transaction auto-categorisation rules. \
+            Each rule has conditions (criteria to match transactions) and actions \
+            (fields to set when matched). conditions and actions are JSON arrays. \
+            stage is 'pre', 'post', or null (default/main execution order).")]
+    async fn get_rules(&self) -> McpResult<String> {
+        json_result(&self.query(db::get_rules).await?)
+    }
+
+    #[tool("Aggregate expense spending by payee between two dates (YYYY-MM-DD). \
+            Only expense transactions (negative amounts) are included. \
+            Split transactions are attributed to the payee on the parent row, \
+            so each purchase is counted once. Results are ordered most-spent first.")]
+    async fn spending_by_payee(
+        &self,
+        start_date: String,
+        end_date: String,
+    ) -> McpResult<String> {
+        let start = date_str_to_int(&start_date).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid start_date '{start_date}'; expected YYYY-MM-DD"
+            ))
+        })?;
+        let end = date_str_to_int(&end_date).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid end_date '{end_date}'; expected YYYY-MM-DD"
+            ))
+        })?;
+        json_result(&self.query(move |p| db::spending_by_payee(p, start, end)).await?)
+    }
+
+    #[tool("Return transactions that have no category assigned. \
+            Split parent rows are excluded because their NULL category is intentional — \
+            the real categories live on their child rows. \
+            account_id is optional (omit for all accounts). \
+            start_date and end_date are optional ISO dates (YYYY-MM-DD). \
+            limit caps the number returned (default 200, max 2000).")]
+    async fn uncategorized_transactions(
+        &self,
+        account_id: Option<String>,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<i64>,
+    ) -> McpResult<String> {
+        let start = start_date
+            .as_deref()
+            .map(|d| {
+                date_str_to_int(d).ok_or_else(|| {
+                    McpError::invalid_params(format!(
+                        "Invalid start_date '{d}'; expected YYYY-MM-DD"
+                    ))
+                })
+            })
+            .transpose()?;
+        let end = end_date
+            .as_deref()
+            .map(|d| {
+                date_str_to_int(d).ok_or_else(|| {
+                    McpError::invalid_params(format!(
+                        "Invalid end_date '{d}'; expected YYYY-MM-DD"
+                    ))
+                })
+            })
+            .transpose()?;
+        let limit = limit.unwrap_or(200).clamp(1, 2000);
+        json_result(
+            &self
+                .query(move |p| {
+                    db::uncategorized_transactions(p, account_id.as_deref(), start, end, limit)
+                })
+                .await?,
+        )
     }
 }

@@ -2,15 +2,20 @@
 
 ## v1 — Read-only (current)
 
+**Query tools:**
 - `list_accounts` — all accounts with current balance
-- `get_transactions` — transaction history with optional account/date filters
+- `get_transactions` — transaction history; filters: account, date range, amount range, category, payee (partial), notes (partial)
 - `list_categories` — category groups and categories
 - `list_payees` — all payees
 - `get_budget_month` — budgeted vs. actual by category for a month
 - `monthly_summary` — income, expenses, net per month over a range
 - `spending_by_category` — expense totals by category over a date range
-- `refresh` — re-download budget from server
+- `spending_by_payee` — expense totals by payee over a date range
+- `uncategorized_transactions` — transactions with no category (split parents excluded)
+- `balance_history` — month-by-month running account balance with true cumulative totals
 - `net_worth` — total balance across all on-budget accounts
+- `get_rules` — auto-categorisation rules with parsed conditions and actions
+- `refresh` — re-download budget from server (server mode only)
 
 **Access modes:**
 - **Local mode**: `ACTUAL_DB_PATH` → read an already-synced `db.sqlite` directly
