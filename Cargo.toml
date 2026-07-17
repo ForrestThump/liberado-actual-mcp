@@ -1,3 +1,8 @@
+# Standalone workspace root. This crate is its own GitHub repo and only sits inside the life-os
+# checkout while being worked on; without this, cargo walks up, finds life-os's workspace manifest,
+# and refuses to build.
+[workspace]
+
 [package]
 name = "liberado-actual-mcp"
 version = "0.1.0"
@@ -8,7 +13,13 @@ name = "liberado-actual-mcp"
 path = "src/main.rs"
 
 [dependencies]
-turbomcp          = { version = "3.1.2", features = ["http"] }
+# Fleet standard: the ForrestThump fork, pinned by rev — same pin as every other liberado-*-mcp.
+# crates.io 3.1.2 compiles but predates two HTTP fixes the fork carries (notably the POST-response
+# SSE stream hang, 919f144). Pinned by `rev` not `branch`: the container builds straight from
+# GitHub, and a branch would let the MCP layer move under a rebuild with no commit here to show it.
+# NOTE: this crate's reqwest is 0.12, which is semver-incompatible with turbomcp's 0.13 — so they
+# do NOT unify, and this server dodges the feature-unification trap that broke liberado-spider-mcp.
+turbomcp          = { git = "https://github.com/ForrestThump/turbomcp.git", rev = "d47a8cabe1647a92046d8d7765ca0b4f2e8819d5", features = ["http"] }
 tokio             = { version = "1", features = ["full"] }
 reqwest           = { version = "0.12", features = ["json"] }
 serde             = { version = "1", features = ["derive"] }

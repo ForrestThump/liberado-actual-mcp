@@ -1,8 +1,11 @@
-FROM rust:1.87-slim AS builder
+# Rust 1.94: turbomcp is edition 2024 and declares rust-version 1.89, so the previous 1.87 pin
+# cannot build this crate at all. `git` is required now that turbomcp is a git dependency rather
+# than a crates.io one — the -slim image does not ship it.
+FROM rust:1.94-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev git && \
     cargo build --release && \
     strip target/release/liberado-actual-mcp
 
