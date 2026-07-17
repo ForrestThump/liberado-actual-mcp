@@ -59,16 +59,33 @@ impl ActualClient {
 
     pub async fn login(&self, password: &str) -> anyhow::Result<String> {
         let url = format!("{}/account/login", self.server_url);
-        let resp: ApiResponse<LoginData> = self
+        let response = self
             .client
             .post(&url)
             .json(&serde_json::json!({ "password": password }))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
-        Ok(check_response(resp, "login")?.token)
+
+        // Deliberately no `error_for_status()` here. Actual answers a failed login with HTTP 400
+        // *and* a JSON body carrying the real cause (e.g. {"status":"error","reason":
+        // "invalid-password"}). error_for_status() discards that body, so a simple wrong password
+        // surfaced as an opaque "HTTP status client error (400 Bad Request)" and looked like a
+        // protocol bug. Read the body first and report the server's own reason.
+        let status = response.status();
+        let body = response.text().await?;
+
+        match serde_json::from_str::<ApiResponse<LoginData>>(&body) {
+            Ok(parsed) => Ok(check_response(parsed, "login")?.token),
+            Err(parse_err) => {
+                if let Some(reason) = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned))
+                {
+                    bail!("login rejected by the Actual server: {reason} (HTTP {status})");
+                }
+                bail!("login failed: HTTP {status}, unparseable response ({parse_err}): {body}");
+            }
+        }
     }
 
     pub async fn list_files(&self, token: &str) -> anyhow::Result<Vec<UserFile>> {
