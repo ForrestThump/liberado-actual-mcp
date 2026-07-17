@@ -74,16 +74,23 @@ impl ActualClient {
         let status = response.status();
         let body = response.text().await?;
 
+        // The failure body parses cleanly as ApiResponse (status="error", data=null), so checking
+        // only the parse result would report a generic "status 'error'" and still bury the cause.
+        // Pull `reason` out of the raw body before anything else.
+        if let Some(reason) = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned))
+        {
+            bail!(
+                "login rejected by the Actual server: {reason} (HTTP {status}). \
+                 Check ACTUAL_PASSWORD."
+            );
+        }
+
         match serde_json::from_str::<ApiResponse<LoginData>>(&body) {
             Ok(parsed) => Ok(check_response(parsed, "login")?.token),
             Err(parse_err) => {
-                if let Some(reason) = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned))
-                {
-                    bail!("login rejected by the Actual server: {reason} (HTTP {status})");
-                }
-                bail!("login failed: HTTP {status}, unparseable response ({parse_err}): {body}");
+                bail!("login failed: HTTP {status}, unparseable response ({parse_err}): {body}")
             }
         }
     }
