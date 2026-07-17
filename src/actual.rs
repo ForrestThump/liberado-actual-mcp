@@ -18,10 +18,41 @@ pub struct ActualClient {
 
 impl ActualClient {
     pub fn new(server_url: String) -> anyhow::Result<Self> {
+        let mut builder = Client::builder().timeout(Duration::from_secs(30));
+
+        // Self-hosted Actual servers routinely sit behind a private CA or a self-signed cert, which
+        // this client rejects by default with an opaque "error sending request". Two escape hatches,
+        // in order of preference:
+        //
+        // ACTUAL_CA_CERT — path to a PEM cert/chain to trust. The correct fix: verification stays
+        // on, we just teach the client about the private CA.
+        //
+        // ACTUAL_TLS_INSECURE — skip verification entirely. Opt-in and OFF by default because it
+        // drops MITM protection; only reasonable for a private-LAN server you control. It is loud
+        // in the logs on purpose, so a temporary workaround cannot quietly become permanent.
+        if let Ok(path) = std::env::var("ACTUAL_CA_CERT") {
+            let pem = std::fs::read(&path)
+                .map_err(|e| anyhow::anyhow!("ACTUAL_CA_CERT: cannot read {path}: {e}"))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| anyhow::anyhow!("ACTUAL_CA_CERT: {path} is not valid PEM: {e}"))?;
+            tracing::info!(ca_cert = %path, "trusting private CA for the Actual server");
+            builder = builder.add_root_certificate(cert);
+        }
+
+        let insecure = std::env::var("ACTUAL_TLS_INSECURE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if insecure {
+            tracing::warn!(
+                "ACTUAL_TLS_INSECURE is set: TLS certificate verification is DISABLED for the \
+                 Actual server. Traffic is encrypted but not authenticated, so this is only safe \
+                 on a private network you control. Prefer ACTUAL_CA_CERT."
+            );
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()?,
+            client: builder.build()?,
             server_url: server_url.trim_end_matches('/').to_string(),
         })
     }
