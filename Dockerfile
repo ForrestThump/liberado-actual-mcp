@@ -1,7 +1,10 @@
 # Rust 1.94: turbomcp is edition 2024 and declares rust-version 1.89, so the previous 1.87 pin
 # cannot build this crate at all. `git` is required now that turbomcp is a git dependency rather
 # than a crates.io one — the -slim image does not ship it.
-FROM rust:1.94-slim AS builder
+# MUST stay on -bookworm to match the debian:bookworm-slim runtime below. The bare `rust:1.94-slim`
+# tag is trixie-based (glibc 2.38) and produces a binary that dies on bookworm (glibc 2.36) with
+# "GLIBC_2.38 not found". Bump both stages together or not at all.
+FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
