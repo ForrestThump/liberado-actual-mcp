@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
     strip target/release/liberado-actual-mcp
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+# curl is required by the compose healthcheck (`curl -s http://localhost:8000/`). Without it the
+# healthcheck can never pass and the container sits permanently unhealthy.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --system --create-home --uid 1001 app
 COPY --from=builder /build/target/release/liberado-actual-mcp /usr/local/bin/
