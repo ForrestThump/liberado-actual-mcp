@@ -18,10 +18,24 @@ pub struct UserFile {
     #[serde(rename = "fileId")]
     pub file_id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_deleted")]
     pub deleted: bool,
     #[serde(rename = "encryptKeyId")]
     pub encrypt_key_id: Option<String>,
+}
+
+/// The server has sent `deleted` as both a JSON boolean and an integer at
+/// different versions; accept either (and treat anything else as false).
+fn de_deleted<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Bool(b) => b,
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    })
 }
 
 // ── Tool output structs (serialized as JSON to the MCP client) ───────────────

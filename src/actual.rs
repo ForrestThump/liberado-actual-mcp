@@ -96,7 +96,7 @@ impl ActualClient {
     }
 
     pub async fn list_files(&self, token: &str) -> anyhow::Result<Vec<UserFile>> {
-        let url = format!("{}/list-user-files", self.server_url);
+        let url = format!("{}/sync/list-user-files", self.server_url);
         let resp: ApiResponse<Vec<UserFile>> = self
             .client
             .get(&url)
@@ -113,7 +113,7 @@ impl ActualClient {
     }
 
     pub async fn download_file(&self, token: &str, file_id: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!("{}/download-user-file", self.server_url);
+        let url = format!("{}/sync/download-user-file", self.server_url);
         let bytes = self
             .client
             .get(&url)
