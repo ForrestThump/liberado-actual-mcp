@@ -18,7 +18,7 @@ pub fn list_accounts(path: &std::path::Path) -> rusqlite::Result<Vec<Account>> {
          LEFT JOIN transactions t
            ON t.acct = a.id
            AND t.tombstone = 0
-           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND (t.isChild = 0 OR t.isChild IS NULL)
          WHERE a.tombstone = 0
          GROUP BY a.id, a.name, a.type, a.offbudget, a.closed, a.sort_order
          ORDER BY a.sort_order, a.name",
@@ -66,7 +66,7 @@ pub fn get_transactions(
          LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
          LEFT JOIN categories c ON c.id = t.category AND c.tombstone = 0
          WHERE t.tombstone = 0
-           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND (t.isChild = 0 OR t.isChild IS NULL)
            AND (?1 IS NULL OR t.acct = ?1)
            AND (?2 IS NULL OR t.date >= ?2)
            AND (?3 IS NULL OR t.date <= ?3)
@@ -201,7 +201,7 @@ pub fn get_budget_month(
              WHERE tombstone = 0
                -- Split categories live on child rows; the parent holds the
                -- total with a NULL category. Exclude parents, keep children.
-               AND (is_parent = 0 OR is_parent IS NULL)
+               AND (isParent = 0 OR isParent IS NULL)
                AND date >= ?2 AND date < ?3
              GROUP BY category
          ) ts ON ts.category = c.id
@@ -261,7 +261,7 @@ pub fn monthly_summary(
                 SUM(CASE WHEN t.amount < 0 THEN t.amount ELSE 0 END) AS expenses
          FROM transactions t
          WHERE t.tombstone = 0
-           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND (t.isChild = 0 OR t.isChild IS NULL)
            AND t.date >= ?1 AND t.date < ?2
          GROUP BY ym
          ORDER BY ym",
@@ -305,7 +305,7 @@ pub fn spending_by_category(
          WHERE t.tombstone = 0
            -- Split categories live on child rows (parent holds the total with a
            -- NULL category); exclude parents and keep children for per-category sums.
-           AND (t.is_parent = 0 OR t.is_parent IS NULL)
+           AND (t.isParent = 0 OR t.isParent IS NULL)
            AND t.amount < 0
            AND t.date >= ?1 AND t.date <= ?2
          GROUP BY c.id
@@ -346,7 +346,7 @@ pub fn spending_by_payee(
            -- Use non-child rows: regular transactions + split parents.
            -- This attributes the full split amount to its payee without
            -- double-counting via child rows.
-           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND (t.isChild = 0 OR t.isChild IS NULL)
            AND t.amount < 0
            AND t.date >= ?1 AND t.date <= ?2
          GROUP BY COALESCE(pm.targetId, t.description)
@@ -365,7 +365,7 @@ pub fn spending_by_payee(
 }
 
 /// Return transactions that have no category assigned.
-/// Split parent rows (is_parent=1) are excluded because their NULL category
+/// Split parent rows (isParent=1) are excluded because their NULL category
 /// is intentional — the real categories live on their child rows.
 pub fn uncategorized_transactions(
     path: &std::path::Path,
@@ -385,8 +385,8 @@ pub fn uncategorized_transactions(
          LEFT JOIN payee_mapping pm ON pm.id = t.description
          LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
          WHERE t.tombstone = 0
-           AND (t.is_child = 0 OR t.is_child IS NULL)
-           AND (t.is_parent = 0 OR t.is_parent IS NULL)
+           AND (t.isChild = 0 OR t.isChild IS NULL)
+           AND (t.isParent = 0 OR t.isParent IS NULL)
            AND t.category IS NULL
            AND (?1 IS NULL OR t.acct = ?1)
            AND (?2 IS NULL OR t.date >= ?2)
@@ -445,7 +445,7 @@ pub fn balance_history(
                  SELECT (t.date / 100) AS ym, SUM(t.amount) AS month_net
                  FROM transactions t
                  WHERE t.tombstone = 0
-                   AND (t.is_child = 0 OR t.is_child IS NULL)
+                   AND (t.isChild = 0 OR t.isChild IS NULL)
                    AND (?1 IS NULL OR t.acct = ?1)
                    AND t.date / 100 <= ?3
                  GROUP BY ym
@@ -501,7 +501,7 @@ pub fn net_worth(path: &std::path::Path) -> rusqlite::Result<i64> {
          FROM transactions t
          JOIN accounts a ON a.id = t.acct AND a.tombstone = 0
          WHERE t.tombstone = 0
-           AND (t.is_child = 0 OR t.is_child IS NULL)
+           AND (t.isChild = 0 OR t.isChild IS NULL)
            AND a.closed = 0
            AND a.offbudget = 0",
         [],
@@ -558,8 +558,8 @@ mod tests {
                 cleared INTEGER DEFAULT 0,
                 reconciled INTEGER DEFAULT 0,
                 tombstone INTEGER DEFAULT 0,
-                is_child INTEGER DEFAULT 0,
-                is_parent INTEGER DEFAULT 0
+                isChild INTEGER DEFAULT 0,
+                isParent INTEGER DEFAULT 0
              );
              -- Both budget tables always exist; month is an INTEGER (YYYYMM).
              CREATE TABLE zero_budgets (
@@ -581,7 +581,7 @@ mod tests {
              INSERT INTO payees VALUES ('pay2','Electric Co',NULL,0);
              INSERT INTO payee_mapping VALUES ('pay1','pay1');
              INSERT INTO payee_mapping VALUES ('pay2','pay2');
-             -- Transactions (amounts in cents: 100 = $1.00); trailing cols: tombstone, is_child, is_parent
+             -- Transactions (amounts in cents: 100 = $1.00); trailing cols: tombstone, isChild, isParent
              INSERT INTO transactions VALUES ('t1','acc1',20240115,-5000,'pay1','weekly shop','cat1',1,0,0,0,0);
              INSERT INTO transactions VALUES ('t2','acc1',20240120,-2000,'pay2',NULL,'cat2',1,0,0,0,0);
              INSERT INTO transactions VALUES ('t3','acc1',20240201,100000,NULL,'salary',NULL,1,0,0,0,0);
@@ -696,8 +696,8 @@ mod tests {
                 id TEXT, acct TEXT, date INTEGER, amount INTEGER,
                 description TEXT, notes TEXT, category TEXT,
                 cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
-                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
-                is_parent INTEGER DEFAULT 0
+                tombstone INTEGER DEFAULT 0, isChild INTEGER DEFAULT 0,
+                isParent INTEGER DEFAULT 0
              );
              -- month column stores INTEGER values as Actual Budget does in production
              CREATE TABLE zero_budgets (
@@ -824,8 +824,8 @@ mod tests {
     }
 
     /// A budget with one normal transaction plus a split (parent + two children).
-    /// Mirrors Actual: the parent (is_parent=1) holds the total with a NULL
-    /// category; each child (is_child=1) carries its own category and amount.
+    /// Mirrors Actual: the parent (isParent=1) holds the total with a NULL
+    /// category; each child (isChild=1) carries its own category and amount.
     fn test_db_splits() -> NamedTempFile {
         let tmp = NamedTempFile::new().expect("temp file");
         let conn = Connection::open(tmp.path()).expect("open");
@@ -849,8 +849,8 @@ mod tests {
                 id TEXT, acct TEXT, date INTEGER, amount INTEGER,
                 description TEXT, notes TEXT, category TEXT,
                 cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
-                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
-                is_parent INTEGER DEFAULT 0
+                tombstone INTEGER DEFAULT 0, isChild INTEGER DEFAULT 0,
+                isParent INTEGER DEFAULT 0
              );
              CREATE TABLE payees (id TEXT, name TEXT, transfer_acct TEXT, tombstone INTEGER DEFAULT 0);
              CREATE TABLE payee_mapping (id TEXT, targetId TEXT);
@@ -861,12 +861,12 @@ mod tests {
              INSERT INTO category_groups VALUES ('grp1','Bills',0,0,0,1);
              INSERT INTO categories VALUES ('cat1','Groceries','grp1',0,0,0,1);
              INSERT INTO categories VALUES ('cat2','Utilities','grp1',0,0,0,2);
-             -- trailing cols: tombstone, is_child, is_parent
+             -- trailing cols: tombstone, isChild, isParent
              -- Normal transaction
              INSERT INTO transactions VALUES ('n1','acc1',20240115,-1000,NULL,NULL,'cat1',1,0,0,0,0);
-             -- Split: parent total -5000, NULL category, is_parent=1
+             -- Split: parent total -5000, NULL category, isParent=1
              INSERT INTO transactions VALUES ('p1','acc1',20240116,-5000,NULL,NULL,NULL,1,0,0,0,1);
-             -- Split children carry the categorized amounts, is_child=1
+             -- Split children carry the categorized amounts, isChild=1
              INSERT INTO transactions VALUES ('c1','acc1',20240116,-2000,NULL,NULL,'cat1',1,0,0,1,0);
              INSERT INTO transactions VALUES ('c2','acc1',20240116,-3000,NULL,NULL,'cat2',1,0,0,1,0);
              INSERT INTO zero_budgets VALUES ('zb1',202401,'cat1',60000);
@@ -937,8 +937,8 @@ mod tests {
                 id TEXT, acct TEXT, date INTEGER, amount INTEGER,
                 description TEXT, notes TEXT, category TEXT,
                 cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
-                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
-                is_parent INTEGER DEFAULT 0
+                tombstone INTEGER DEFAULT 0, isChild INTEGER DEFAULT 0,
+                isParent INTEGER DEFAULT 0
              );
              CREATE TABLE zero_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
              CREATE TABLE reflect_budgets (id TEXT, month INTEGER, category TEXT, amount INTEGER);
@@ -974,8 +974,8 @@ mod tests {
                 id TEXT, acct TEXT, date INTEGER, amount INTEGER,
                 description TEXT, notes TEXT, category TEXT,
                 cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
-                tombstone INTEGER DEFAULT 0, is_child INTEGER DEFAULT 0,
-                is_parent INTEGER DEFAULT 0
+                tombstone INTEGER DEFAULT 0, isChild INTEGER DEFAULT 0,
+                isParent INTEGER DEFAULT 0
              );
              -- 'old' was merged into 'keep' and tombstoned; mapping redirects it.
              INSERT INTO payees VALUES ('keep','Grocery Store',NULL,0);
@@ -1117,9 +1117,9 @@ mod tests {
     #[test]
     fn uncategorized_transactions_excludes_split_parents() {
         let db = test_db_splits();
-        // p1 is a split parent (is_parent=1, category=NULL) — must be excluded
+        // p1 is a split parent (isParent=1, category=NULL) — must be excluded
         // n1 has category cat1 — not uncategorized
-        // c1 and c2 are children (is_child=1) — excluded
+        // c1 and c2 are children (isChild=1) — excluded
         // No remaining regular uncategorized rows → empty result
         let txns = uncategorized_transactions(db.path(), None, None, None, 500).unwrap();
         assert_eq!(txns.len(), 0, "split parent with NULL category must not appear");
