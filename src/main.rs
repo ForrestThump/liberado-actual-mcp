@@ -2,6 +2,7 @@ mod actual;
 mod budget_api;
 mod db;
 mod models;
+mod pattern;
 mod server;
 
 use server::ActualServer;

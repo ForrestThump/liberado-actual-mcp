@@ -20,11 +20,32 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `monthly_summary` | Income, expenses, net savings per month over a range |
 | `spending_by_category` | Expense totals grouped by category for a date range |
 | `spending_by_payee` | Expense totals grouped by payee for a date range |
-| `uncategorized_transactions` | Transactions with no category (excludes split parents) |
+| `uncategorized_transactions` | Transactions with no category or reserved Uncategorized (excludes split parents) |
+| `transactions_by_category` | Newest transactions whose category name matches a regex |
+| `budget_api_uncategorized` | Same as uncategorized_transactions, live from Liberado Budget REST |
+| `budget_api_transactions_by_category` | Category-regex transactions from Liberado Budget REST |
 | `balance_history` | Month-by-month running account balance |
 | `net_worth` | Total balance across all on-budget accounts |
 | `get_rules` | Auto-categorisation rules with parsed conditions and actions |
 | `refresh` | Re-download latest budget data from server (server mode only) |
+
+### Write tools
+
+Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly.
+
+| Tool | Description |
+|---|---|
+| `create_category` | Create an envelope category |
+| `update_category` | Rename or hide a category |
+| `create_payee` | Create a payee by display name |
+| `rename_payee` | Rename a payee |
+| `set_transaction_category` | Set one transaction's category |
+| `set_transaction_payee` | Set one transaction's payee |
+| `categorize_transactions` | Bulk-assign category; optional learn-from-payees |
+| `create_payee_rule` | Create a payee-regex auto-categorisation rule |
+| `apply_rules` | Re-run rules on uncategorized transactions |
+
+Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
 
 ### `get_transactions` parameters
 
@@ -136,6 +157,7 @@ Or for a running HTTP server:
 | `ACTUAL_SERVER_URL` | Server mode | URL of your Actual Budget server |
 | `ACTUAL_PASSWORD` | Server mode | Server password |
 | `ACTUAL_BUDGET_ID` | Server mode | Budget sync ID (uses first if omitted) |
+| `LIBERADO_BUDGET_API_URL` | Write tools | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
 | `BIND_ADDR` | No | Enables HTTP transport on this address; binary defaults to STDIO when unset (Docker image sets `0.0.0.0:8000`) |
 
 ---

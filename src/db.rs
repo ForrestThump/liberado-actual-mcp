@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OpenFlags, params};
 
-use crate::models::*;
+use crate::{models::*, pattern};
 
 fn open(path: &std::path::Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
@@ -364,7 +364,7 @@ pub fn spending_by_payee(
     rows.collect()
 }
 
-/// Return transactions that have no category assigned.
+/// Return transactions with no category or the reserved "Uncategorized" category.
 /// Split parent rows (isParent=1) are excluded because their NULL category
 /// is intentional — the real categories live on their child rows.
 pub fn uncategorized_transactions(
@@ -378,16 +378,19 @@ pub fn uncategorized_transactions(
     let mut stmt = conn.prepare(
         "SELECT t.id, t.date, t.amount,
                 COALESCE(p.name, ''),
+                COALESCE(c.name, ''),
                 COALESCE(t.notes, ''),
                 COALESCE(t.cleared, 0),
                 COALESCE(t.reconciled, 0)
          FROM transactions t
          LEFT JOIN payee_mapping pm ON pm.id = t.description
          LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
+         LEFT JOIN categories c ON c.id = t.category AND c.tombstone = 0
          WHERE t.tombstone = 0
            AND (t.isChild = 0 OR t.isChild IS NULL)
            AND (t.isParent = 0 OR t.isParent IS NULL)
-           AND t.category IS NULL
+           AND (t.category IS NULL OR LOWER(c.name) = 'uncategorized')
+           AND COALESCE(t.notes, '') != 'Opening balance'
            AND (?1 IS NULL OR t.acct = ?1)
            AND (?2 IS NULL OR t.date >= ?2)
            AND (?3 IS NULL OR t.date <= ?3)
@@ -403,10 +406,102 @@ pub fn uncategorized_transactions(
             amount_cents: amount,
             amount_display: format_amount(amount),
             payee: row.get(3)?,
-            category: String::new(),
-            notes: row.get(4)?,
-            cleared: row.get::<_, i64>(5)? != 0,
-            reconciled: row.get::<_, i64>(6)? != 0,
+            category: row.get(4)?,
+            notes: row.get(5)?,
+            cleared: row.get::<_, i64>(6)? != 0,
+            reconciled: row.get::<_, i64>(7)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Return recent transactions whose category name matches `category_regex`.
+/// Plain text patterns match as case-insensitive substrings; metacharacters
+/// are interpreted as full regex (mirrors liberado-budget semantics).
+pub fn transactions_by_category_regex(
+    path: &std::path::Path,
+    category_regex: &str,
+    account_id: Option<&str>,
+    start_date: Option<i64>,
+    end_date: Option<i64>,
+    limit: i64,
+) -> rusqlite::Result<Vec<Transaction>> {
+    let conn = open(path)?;
+
+    let mut cat_stmt = conn.prepare(
+        "SELECT id, name FROM categories WHERE tombstone = 0",
+    )?;
+    let matching_ids: Vec<String> = cat_stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((id, name))
+        })?
+        .filter_map(|r| r.ok())
+        .filter(|(_, name)| pattern::regex_matches(name, category_regex))
+        .map(|(id, _)| id)
+        .collect();
+
+    if matching_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let placeholders: Vec<String> = matching_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 5))
+        .collect();
+    let in_clause = placeholders.join(", ");
+
+    let sql = format!(
+        "SELECT t.id, t.date, t.amount,
+                COALESCE(p.name, ''),
+                COALESCE(c.name, ''),
+                COALESCE(t.notes, ''),
+                COALESCE(t.cleared, 0),
+                COALESCE(t.reconciled, 0)
+         FROM transactions t
+         LEFT JOIN payee_mapping pm ON pm.id = t.description
+         LEFT JOIN payees p ON p.id = COALESCE(pm.targetId, t.description) AND p.tombstone = 0
+         LEFT JOIN categories c ON c.id = t.category AND c.tombstone = 0
+         WHERE t.tombstone = 0
+           AND (t.isChild = 0 OR t.isChild IS NULL)
+           AND (t.isParent = 0 OR t.isParent IS NULL)
+           AND t.category IN ({in_clause})
+           AND COALESCE(t.notes, '') != 'Opening balance'
+           AND (?1 IS NULL OR t.acct = ?1)
+           AND (?2 IS NULL OR t.date >= ?2)
+           AND (?3 IS NULL OR t.date <= ?3)
+         ORDER BY t.date DESC, t.id
+         LIMIT ?4"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(account_id),
+        Box::new(start_date),
+        Box::new(end_date),
+        Box::new(limit),
+    ];
+    for id in &matching_ids {
+        params_vec.push(Box::new(id.clone()));
+    }
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        let raw_date: i64 = row.get(1)?;
+        let amount: i64 = row.get(2)?;
+        Ok(Transaction {
+            id: row.get(0)?,
+            date: date_int_to_str(raw_date),
+            amount_cents: amount,
+            amount_display: format_amount(amount),
+            payee: row.get(3)?,
+            category: row.get(4)?,
+            notes: row.get(5)?,
+            cleared: row.get::<_, i64>(6)? != 0,
+            reconciled: row.get::<_, i64>(7)? != 0,
         })
     })?;
     rows.collect()
@@ -1141,5 +1236,39 @@ mod tests {
         // acc2 only has t4 which IS categorized; no uncategorized transactions in acc2
         let txns = uncategorized_transactions(db.path(), Some("acc2"), None, None, 500).unwrap();
         assert_eq!(txns.len(), 0);
+    }
+
+    #[test]
+    fn uncategorized_transactions_includes_reserved_category() {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let conn = Connection::open(tmp.path()).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE payees (id TEXT, name TEXT, transfer_acct TEXT, tombstone INTEGER DEFAULT 0);
+             CREATE TABLE payee_mapping (id TEXT, targetId TEXT);
+             CREATE TABLE categories (id TEXT, name TEXT, cat_group TEXT, tombstone INTEGER DEFAULT 0);
+             CREATE TABLE transactions (
+                id TEXT, acct TEXT, date INTEGER, amount INTEGER,
+                description TEXT, notes TEXT, category TEXT,
+                cleared INTEGER DEFAULT 0, reconciled INTEGER DEFAULT 0,
+                tombstone INTEGER DEFAULT 0, isChild INTEGER DEFAULT 0,
+                isParent INTEGER DEFAULT 0
+             );
+             INSERT INTO categories VALUES ('uncat','Uncategorized','grp1',0);
+             INSERT INTO transactions VALUES ('t1','acc1',20240115,-1000,NULL,NULL,'uncat',1,0,0,0,0);",
+        )
+        .expect("schema");
+        drop(conn);
+        let txns = uncategorized_transactions(tmp.path(), None, None, None, 500).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].category, "Uncategorized");
+    }
+
+    #[test]
+    fn transactions_by_category_regex_matches_name() {
+        let db = test_db();
+        let txns =
+            transactions_by_category_regex(db.path(), "Grocer", None, None, None, 500).unwrap();
+        assert_eq!(txns.len(), 2);
+        assert!(txns.iter().all(|t| t.category == "Groceries"));
     }
 }
