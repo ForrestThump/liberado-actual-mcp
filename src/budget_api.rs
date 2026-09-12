@@ -197,12 +197,12 @@ impl BudgetApi {
 
     pub async fn create_payee_rule(
         &self,
-        payee_contains: &str,
+        payee_regex: &str,
         category: &str,
     ) -> Result<Value, String> {
-        let needle = payee_contains.trim();
+        let needle = payee_regex.trim();
         if needle.is_empty() {
-            return Err("payee_contains is required".into());
+            return Err("payee_regex is required".into());
         }
         let category_id = self.resolve_category(category).await?;
         let rules = self.get("/api/v1/rules").await?;
@@ -210,20 +210,68 @@ impl BudgetApi {
             return Ok(json!({
                 "created": false,
                 "id": existing,
-                "reason": "equivalent payee-contains rule already exists",
+                "reason": "equivalent payee regex rule already exists",
                 "category_id": category_id,
-                "payee_contains": needle,
+                "payee_regex": needle,
+                "matched": 0,
             }));
         }
         let body = payee_rule_body(needle, &category_id);
         let v = self.post("/api/v1/rules", &body).await?;
         let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let matched = v.get("matched").and_then(|x| x.as_u64()).unwrap_or(0);
         Ok(json!({
             "created": true,
             "id": id,
             "category_id": category_id,
-            "payee_contains": needle,
+            "payee_regex": needle,
+            "matched": matched,
         }))
+    }
+
+    pub async fn get_uncategorized_transactions(
+        &self,
+        account_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Value, String> {
+        let limit = limit.unwrap_or(50).clamp(1, 2000);
+        let mut qs = format!("limit={limit}");
+        if let Some(a) = account_id {
+            qs.push_str(&format!("&account_id={a}"));
+        }
+        if let Some(s) = start_date {
+            qs.push_str(&format!("&start_date={s}"));
+        }
+        if let Some(e) = end_date {
+            qs.push_str(&format!("&end_date={e}"));
+        }
+        self.get(&format!("/api/v1/transactions/uncategorized?{qs}"))
+            .await
+    }
+
+    pub async fn get_transactions_by_category_regex(
+        &self,
+        category_regex: &str,
+        account_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Value, String> {
+        let limit = limit.unwrap_or(50).clamp(1, 2000);
+        let mut qs = format!("category_regex={category_regex}&limit={limit}");
+        if let Some(a) = account_id {
+            qs.push_str(&format!("&account_id={a}"));
+        }
+        if let Some(s) = start_date {
+            qs.push_str(&format!("&start_date={s}"));
+        }
+        if let Some(e) = end_date {
+            qs.push_str(&format!("&end_date={e}"));
+        }
+        self.get(&format!("/api/v1/transactions/by-category?{qs}"))
+            .await
     }
 
     pub async fn apply_rules(
@@ -275,14 +323,14 @@ impl BudgetApi {
     }
 }
 
-pub fn payee_rule_body(payee_contains: &str, category_id: &str) -> Value {
+pub fn payee_rule_body(payee_regex: &str, category_id: &str) -> Value {
     json!({
         "stage": "pre",
         "conditions_op": "and",
         "conditions": [{
             "field": "payee",
-            "op": "contains",
-            "value": payee_contains,
+            "op": "regex",
+            "value": payee_regex,
         }],
         "actions": [{
             "field": "category",
@@ -334,22 +382,24 @@ pub fn resolve_payee_id(doc: &Value, name_or_id: &str) -> Option<String> {
     by_name
 }
 
-pub fn find_equivalent_payee_rule(doc: &Value, payee_contains: &str, category_id: &str) -> Option<String> {
-    let needle = payee_contains.trim().to_lowercase();
+pub fn find_equivalent_payee_rule(doc: &Value, payee_regex: &str, category_id: &str) -> Option<String> {
+    let needle = payee_regex.trim().to_lowercase();
     let rules = doc.get("rules")?.as_array()?;
     for r in rules {
         let conds = r.get("conditions").and_then(|c| c.as_array())?;
         let acts = r.get("actions").and_then(|c| c.as_array())?;
         let payee_ok = conds.iter().any(|c| {
-            c.get("field").and_then(|x| x.as_str()).unwrap_or("") == "payee"
-                && matches!(
-                    c.get("op").and_then(|x| x.as_str()).unwrap_or(""),
-                    "contains" | "is" | "equals"
-                )
-                && c.get("value")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case(&needle)
+            if c.get("field").and_then(|x| x.as_str()).unwrap_or("") != "payee" {
+                return false;
+            }
+            let value = c
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            match c.get("op").and_then(|x| x.as_str()).unwrap_or("regex") {
+                "contains" | "is" | "equals" | "regex" | "" => value.eq_ignore_ascii_case(&needle),
+                _ => false,
+            }
         });
         let cat_ok = acts.iter().any(|a| {
             a.get("field").and_then(|x| x.as_str()).unwrap_or("") == "category"
@@ -453,9 +503,24 @@ mod tests {
     fn payee_rule_body_is_budget_rest_shape() {
         let b = payee_rule_body("FRYS", "c-groc");
         assert_eq!(b["conditions_op"], "and");
-        assert_eq!(b["conditions"][0]["op"], "contains");
+        assert_eq!(b["conditions"][0]["op"], "regex");
         assert_eq!(b["actions"][0]["field"], "category");
         assert_eq!(b["actions"][0]["value"], "c-groc");
+    }
+
+    #[test]
+    fn equivalent_rule_matches_regex_op() {
+        let doc = json!({
+            "rules": [{
+                "id": "r1",
+                "conditions": [{"field": "payee", "op": "regex", "value": "FRYS"}],
+                "actions": [{"field": "category", "value": "c-groc"}]
+            }]
+        });
+        assert_eq!(
+            find_equivalent_payee_rule(&doc, "frys", "c-groc").as_deref(),
+            Some("r1")
+        );
     }
 
     #[tokio::test]
@@ -471,6 +536,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "new-cat");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_payee_rule_returns_matched_count() {
+        let cats = json!({
+            "category_groups": [{
+                "categories": [{"id": "c-groc", "name": "Groceries"}]
+            }]
+        });
+        let (base, h) = spawn_json_mock(vec![
+            ("/api/v1/categories".into(), 200, cats.to_string()),
+            ("/api/v1/rules".into(), 200, json!({"rules": []}).to_string()),
+            (
+                "/api/v1/rules".into(),
+                201,
+                json!({"id": "r-new", "matched": 2}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.create_payee_rule("FRYS", "Groceries").await.unwrap();
+        assert_eq!(v["created"], true);
+        assert_eq!(v["matched"], 2);
         h.join().unwrap();
     }
 

@@ -1330,6 +1330,7 @@ name = "liberado-actual-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "secrecy",

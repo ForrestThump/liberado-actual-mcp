@@ -415,12 +415,13 @@ impl ActualServer {
         json_result(&self.query(move |p| db::spending_by_payee(p, start, end)).await?)
     }
 
-    #[tool("Return transactions that have no category assigned. \
+    #[tool("Return transactions with no category or the reserved Uncategorized category. \
             Split parent rows are excluded because their NULL category is intentional — \
             the real categories live on their child rows. \
             account_id is optional (omit for all accounts). \
             start_date and end_date are optional ISO dates (YYYY-MM-DD). \
-            limit caps the number returned (default 200, max 2000).")]
+            limit caps the number returned (default 200, max 2000). \
+            For live data from the Liberado Budget server, use budget_api_uncategorized.")]
     async fn uncategorized_transactions(
         &self,
         account_id: Option<String>,
@@ -456,6 +457,105 @@ impl ActualServer {
                 })
                 .await?,
         )
+    }
+
+    #[tool("Return recent transactions whose category name matches category_regex. \
+            Plain text matches as case-insensitive substring; metacharacters are full regex. \
+            account_id is optional (omit for all accounts). \
+            start_date and end_date are optional ISO dates (YYYY-MM-DD). \
+            limit caps the number returned (default 500, max 2000).")]
+    async fn transactions_by_category(
+        &self,
+        category_regex: String,
+        account_id: Option<String>,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<i64>,
+    ) -> McpResult<String> {
+        let start = start_date
+            .as_deref()
+            .map(|d| {
+                date_str_to_int(d).ok_or_else(|| {
+                    McpError::invalid_params(format!(
+                        "Invalid start_date '{d}'; expected YYYY-MM-DD"
+                    ))
+                })
+            })
+            .transpose()?;
+        let end = end_date
+            .as_deref()
+            .map(|d| {
+                date_str_to_int(d).ok_or_else(|| {
+                    McpError::invalid_params(format!(
+                        "Invalid end_date '{d}'; expected YYYY-MM-DD"
+                    ))
+                })
+            })
+            .transpose()?;
+        let limit = limit.unwrap_or(500).clamp(1, 2000);
+        let regex = category_regex;
+        json_result(
+            &self
+                .query(move |p| {
+                    db::transactions_by_category_regex(
+                        p,
+                        &regex,
+                        account_id.as_deref(),
+                        start,
+                        end,
+                        limit,
+                    )
+                })
+                .await?,
+        )
+    }
+
+    #[tool("Return uncategorized transactions from the Liberado Budget REST API \
+            (requires LIBERADO_BUDGET_API_URL). Same filters as uncategorized_transactions \
+            but reads live server data when SQLite may be stale.")]
+    async fn budget_api_uncategorized(
+        &self,
+        account_id: Option<String>,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .get_uncategorized_transactions(
+                account_id.as_deref(),
+                start_date.as_deref(),
+                end_date.as_deref(),
+                limit,
+            )
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
+
+    #[tool("Return transactions whose category name matches category_regex from the \
+            Liberado Budget REST API (requires LIBERADO_BUDGET_API_URL). \
+            Plain text matches as case-insensitive substring.")]
+    async fn budget_api_transactions_by_category(
+        &self,
+        category_regex: String,
+        account_id: Option<String>,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .get_transactions_by_category_regex(
+                &category_regex,
+                account_id.as_deref(),
+                start_date.as_deref(),
+                end_date.as_deref(),
+                limit,
+            )
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
     }
 
     #[tool("Create an envelope category. kind is expense (default) or income. \
@@ -524,7 +624,7 @@ impl ActualServer {
     }
 
     #[tool("Assign a category (id or name) to many transactions. \
-            learn=true also creates a payee-contains rule from those payees.")]
+            learn=true also creates a payee-regex rule from those payees.")]
     async fn categorize_transactions(
         &self,
         transaction_ids: Vec<String>,
@@ -552,22 +652,24 @@ impl ActualServer {
         json_result(&serde_json::json!({ "updated": transaction_id, "payee": payee }))
     }
 
-    #[tool("Create a rule: payee contains this string → set category (id or name). \
-            Idempotent: does not duplicate an equivalent rule.")]
+    #[tool("Create a rule: payee matches this regex (plain text = case-insensitive substring) \
+            → set category (id or name). Auto-applies to uncategorized transactions; \
+            response includes matched count. Idempotent: does not duplicate an equivalent rule.")]
     async fn create_payee_rule(
         &self,
-        payee_contains: String,
+        payee_regex: String,
         category: String,
     ) -> McpResult<String> {
         let api = self.budget_writes()?;
         let v = api
-            .create_payee_rule(&payee_contains, &category)
+            .create_payee_rule(&payee_regex, &category)
             .await
             .map_err(McpError::internal)?;
         json_result(&v)
     }
 
-    #[tool("Apply auto-categorisation rules to uncategorized transactions.")]
+    #[tool("Apply auto-categorisation rules to transactions with no category or the \
+            reserved Uncategorized category. Returns matched count.")]
     async fn apply_rules(
         &self,
         account_id: Option<String>,
