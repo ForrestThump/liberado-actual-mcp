@@ -1,4 +1,5 @@
 mod actual;
+mod budget_api;
 mod db;
 mod models;
 mod server;

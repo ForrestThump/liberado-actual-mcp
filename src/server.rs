@@ -5,6 +5,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     actual::{find_budget_file, ActualClient, SQLITE_MAGIC},
+    budget_api::BudgetApi,
     db,
     models::{date_str_to_int, format_amount, month_bounds, month_to_ym},
 };
@@ -34,6 +35,7 @@ struct AppState {
     source: BudgetSource,
     // Arc so query closures can hold a reference that keeps _temp_file alive.
     cache: RwLock<Option<Arc<BudgetCache>>>,
+    budget_api: Option<BudgetApi>,
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -69,6 +71,7 @@ impl ActualServer {
             state: Arc::new(AppState {
                 source,
                 cache: RwLock::new(None),
+                budget_api: BudgetApi::from_env(),
             }),
         })
     }
@@ -199,6 +202,14 @@ impl ActualServer {
         .await
         .map_err(|e| McpError::internal(e.to_string()))?
         .map_err(|e| McpError::internal(format!("Database error: {e}")))
+    }
+
+    fn budget_writes(&self) -> McpResult<&BudgetApi> {
+        self.state.budget_api.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "Write tools require LIBERADO_BUDGET_API_URL (Liberado Budget REST, not SQLite)",
+            )
+        })
     }
 }
 
@@ -445,5 +456,128 @@ impl ActualServer {
                 })
                 .await?,
         )
+    }
+
+    #[tool("Create an envelope category. kind is expense (default) or income. \
+            group_name is optional (defaults to Expenses/Income).")]
+    async fn create_category(
+        &self,
+        name: String,
+        kind: Option<String>,
+        group_name: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let id = api
+            .create_category(&name, kind.as_deref(), group_name.as_deref())
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&serde_json::json!({ "id": id, "name": name }))
+    }
+
+    #[tool("Update a category by id or name. Pass hidden=true to hide it.")]
+    async fn update_category(
+        &self,
+        category: String,
+        name: Option<String>,
+        hidden: Option<bool>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let id = api
+            .update_category(&category, name.as_deref(), hidden)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&serde_json::json!({ "updated": id }))
+    }
+
+    #[tool("Create a payee by display name.")]
+    async fn create_payee(&self, name: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let id = api.create_payee(&name).await.map_err(McpError::internal)?;
+        json_result(&serde_json::json!({ "id": id, "name": name }))
+    }
+
+    #[tool("Rename a payee by id or current name. Transactions keep the same payee id.")]
+    async fn rename_payee(&self, payee: String, new_name: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let id = api
+            .rename_payee(&payee, &new_name)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&serde_json::json!({ "id": id, "name": new_name }))
+    }
+
+    #[tool("Set one transaction's category. category is id, name, or empty/null to clear.")]
+    async fn set_transaction_category(
+        &self,
+        transaction_id: String,
+        category: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let cat = match category.as_deref() {
+            None | Some("") | Some("null") => None,
+            Some(c) => Some(c),
+        };
+        api.set_transaction_category(&transaction_id, cat)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&serde_json::json!({ "updated": transaction_id }))
+    }
+
+    #[tool("Assign a category (id or name) to many transactions. \
+            learn=true also creates a payee-contains rule from those payees.")]
+    async fn categorize_transactions(
+        &self,
+        transaction_ids: Vec<String>,
+        category: String,
+        learn: Option<bool>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .categorize_transactions(&transaction_ids, &category, learn.unwrap_or(false))
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
+
+    #[tool("Set a transaction's payee by display name (creates or matches, like Actual payee_name).")]
+    async fn set_transaction_payee(
+        &self,
+        transaction_id: String,
+        payee: String,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        api.set_transaction_payee(&transaction_id, &payee)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&serde_json::json!({ "updated": transaction_id, "payee": payee }))
+    }
+
+    #[tool("Create a rule: payee contains this string → set category (id or name). \
+            Idempotent: does not duplicate an equivalent rule.")]
+    async fn create_payee_rule(
+        &self,
+        payee_contains: String,
+        category: String,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .create_payee_rule(&payee_contains, &category)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
+
+    #[tool("Apply auto-categorisation rules to uncategorized transactions.")]
+    async fn apply_rules(
+        &self,
+        account_id: Option<String>,
+        limit: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .apply_rules(account_id.as_deref(), limit)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
     }
 }
