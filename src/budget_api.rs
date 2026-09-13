@@ -4,8 +4,8 @@
 //! read-write. Base URL comes from `LIBERADO_BUDGET_API_URL`.
 
 use serde_json::{json, Value};
-use std::net::TcpListener;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::thread;
 
 #[derive(Clone)]
@@ -79,6 +79,10 @@ impl BudgetApi {
         self.send(reqwest::Method::PATCH, path, Some(body)).await
     }
 
+    pub async fn put(&self, path: &str, body: &Value) -> Result<Value, String> {
+        self.send(reqwest::Method::PUT, path, Some(body)).await
+    }
+
     pub async fn create_category(
         &self,
         name: &str,
@@ -116,7 +120,9 @@ impl BudgetApi {
     }
 
     pub async fn create_payee(&self, name: &str) -> Result<String, String> {
-        let v = self.post("/api/v1/payees", &json!({ "name": name })).await?;
+        let v = self
+            .post("/api/v1/payees", &json!({ "name": name }))
+            .await?;
         v.get("id")
             .and_then(|x| x.as_str())
             .map(str::to_string)
@@ -169,10 +175,7 @@ impl BudgetApi {
         let mut updated = Vec::new();
         let mut errors = Vec::new();
         for id in ids {
-            match self
-                .set_transaction_category(id, Some(&category_id))
-                .await
-            {
+            match self.set_transaction_category(id, Some(&category_id)).await {
                 Ok(()) => updated.push(id.clone()),
                 Err(e) => errors.push(json!({ "id": id, "error": e })),
             }
@@ -218,7 +221,11 @@ impl BudgetApi {
         }
         let body = payee_rule_body(needle, &category_id);
         let v = self.post("/api/v1/rules", &body).await?;
-        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let matched = v.get("matched").and_then(|x| x.as_u64()).unwrap_or(0);
         Ok(json!({
             "created": true,
@@ -289,6 +296,59 @@ impl BudgetApi {
         self.post("/api/v1/rules/apply", &body).await
     }
 
+    pub async fn set_budget_amount(
+        &self,
+        month: &str,
+        category: &str,
+        amount_cents: i64,
+    ) -> Result<Value, String> {
+        let id = self.resolve_category(category).await?;
+        self.put(
+            &format!("/api/v1/budgets/{month}/categories/{id}"),
+            &json!({ "amount_cents": amount_cents }),
+        )
+        .await
+    }
+
+    pub async fn set_budget_allocations(
+        &self,
+        month: &str,
+        allocations: &[Value],
+    ) -> Result<Value, String> {
+        let parsed = parse_allocation_items(allocations)?;
+        let cats = self.get("/api/v1/categories").await?;
+        let mut resolved = Vec::with_capacity(parsed.len());
+        for (category, amount_cents) in parsed {
+            let id = resolve_category_id(&cats, &category)
+                .ok_or_else(|| format!("unknown category '{category}'"))?;
+            resolved.push(json!({
+                "category_id": id,
+                "amount_cents": amount_cents,
+            }));
+        }
+        self.put(
+            &format!("/api/v1/budgets/{month}/allocations"),
+            &json!({ "allocations": resolved }),
+        )
+        .await
+    }
+
+    pub async fn copy_budget(&self, month: &str, from_month: &str) -> Result<Value, String> {
+        self.post(
+            &format!("/api/v1/budgets/{month}/copy"),
+            &json!({ "from_month": from_month }),
+        )
+        .await
+    }
+
+    pub async fn rollover_budget(&self, month: &str, from_month: &str) -> Result<Value, String> {
+        self.post(
+            &format!("/api/v1/budgets/{month}/rollover"),
+            &json!({ "from_month": from_month }),
+        )
+        .await
+    }
+
     pub async fn resolve_category(&self, name_or_id: &str) -> Result<String, String> {
         let v = self.get("/api/v1/categories").await?;
         resolve_category_id(&v, name_or_id)
@@ -321,6 +381,31 @@ impl BudgetApi {
         payees.dedup();
         Ok(payees)
     }
+}
+
+/// Parse MCP/REST allocation objects. Each item needs `amount_cents` and either
+/// `category` (id or name) or `category_id`.
+pub fn parse_allocation_items(items: &[Value]) -> Result<Vec<(String, i64)>, String> {
+    if items.is_empty() {
+        return Err("allocations must not be empty".into());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let category = item
+            .get("category")
+            .or_else(|| item.get("category_id"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let category =
+            category.ok_or_else(|| format!("allocations[{i}] missing category or category_id"))?;
+        let amount_cents = item
+            .get("amount_cents")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| format!("allocations[{i}] missing amount_cents"))?;
+        out.push((category.to_string(), amount_cents));
+    }
+    Ok(out)
 }
 
 pub fn payee_rule_body(payee_regex: &str, category_id: &str) -> Value {
@@ -382,7 +467,11 @@ pub fn resolve_payee_id(doc: &Value, name_or_id: &str) -> Option<String> {
     by_name
 }
 
-pub fn find_equivalent_payee_rule(doc: &Value, payee_regex: &str, category_id: &str) -> Option<String> {
+pub fn find_equivalent_payee_rule(
+    doc: &Value,
+    payee_regex: &str,
+    category_id: &str,
+) -> Option<String> {
     let needle = payee_regex.trim().to_lowercase();
     let rules = doc.get("rules")?.as_array()?;
     for r in rules {
@@ -392,10 +481,7 @@ pub fn find_equivalent_payee_rule(doc: &Value, payee_regex: &str, category_id: &
             if c.get("field").and_then(|x| x.as_str()).unwrap_or("") != "payee" {
                 return false;
             }
-            let value = c
-                .get("value")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let value = c.get("value").and_then(|x| x.as_str()).unwrap_or("");
             match c.get("op").and_then(|x| x.as_str()).unwrap_or("regex") {
                 "contains" | "is" | "equals" | "regex" | "" => value.eq_ignore_ascii_case(&needle),
                 _ => false,
@@ -403,10 +489,7 @@ pub fn find_equivalent_payee_rule(doc: &Value, payee_regex: &str, category_id: &
         });
         let cat_ok = acts.iter().any(|a| {
             a.get("field").and_then(|x| x.as_str()).unwrap_or("") == "category"
-                && a.get("value")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    == category_id
+                && a.get("value").and_then(|x| x.as_str()).unwrap_or("") == category_id
         });
         if payee_ok && cat_ok {
             return r.get("id").and_then(|x| x.as_str()).map(str::to_string);
@@ -548,7 +631,11 @@ mod tests {
         });
         let (base, h) = spawn_json_mock(vec![
             ("/api/v1/categories".into(), 200, cats.to_string()),
-            ("/api/v1/rules".into(), 200, json!({"rules": []}).to_string()),
+            (
+                "/api/v1/rules".into(),
+                200,
+                json!({"rules": []}).to_string(),
+            ),
             (
                 "/api/v1/rules".into(),
                 201,
@@ -584,6 +671,135 @@ mod tests {
         let v = api.create_payee_rule("FRYS", "Groceries").await.unwrap();
         assert_eq!(v["created"], false);
         assert_eq!(v["id"], "r-exist");
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn parse_allocations_accepts_category_or_category_id() {
+        let items = vec![
+            json!({"category": "Groceries", "amount_cents": 15000}),
+            json!({"category_id": "c-rent", "amount_cents": 110000}),
+        ];
+        let parsed = parse_allocation_items(&items).unwrap();
+        assert_eq!(
+            parsed,
+            vec![("Groceries".into(), 15000), ("c-rent".into(), 110000)]
+        );
+    }
+
+    #[test]
+    fn parse_allocations_rejects_empty_and_missing_fields() {
+        assert!(parse_allocation_items(&[]).unwrap_err().contains("empty"));
+        assert!(parse_allocation_items(&[json!({"amount_cents": 1})])
+            .unwrap_err()
+            .contains("category"));
+        assert!(parse_allocation_items(&[json!({"category": "Food"})])
+            .unwrap_err()
+            .contains("amount_cents"));
+    }
+
+    #[tokio::test]
+    async fn set_budget_amount_puts_resolved_category() {
+        let cats = json!({
+            "category_groups": [{
+                "categories": [{"id": "c-groc", "name": "Groceries"}]
+            }]
+        });
+        let (base, h) = spawn_json_mock(vec![
+            ("/api/v1/categories".into(), 200, cats.to_string()),
+            (
+                "/api/v1/budgets/2026-07/categories/c-groc".into(),
+                200,
+                json!({
+                    "month": "2026-07",
+                    "category_id": "c-groc",
+                    "amount_cents": 50000
+                })
+                .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .set_budget_amount("2026-07", "Groceries", 50000)
+            .await
+            .unwrap();
+        assert_eq!(v["category_id"], "c-groc");
+        assert_eq!(v["amount_cents"], 50000);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_budget_allocations_resolves_names_then_puts() {
+        let cats = json!({
+            "category_groups": [{
+                "categories": [
+                    {"id": "c-groc", "name": "Groceries"},
+                    {"id": "c-rent", "name": "Rent"}
+                ]
+            }]
+        });
+        let (base, h) = spawn_json_mock(vec![
+            ("/api/v1/categories".into(), 200, cats.to_string()),
+            (
+                "/api/v1/budgets/2026-07/allocations".into(),
+                200,
+                json!({"updated": 2, "month": "2026-07"}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .set_budget_allocations(
+                "2026-07",
+                &[
+                    json!({"category": "Groceries", "amount_cents": 15000}),
+                    json!({"category": "Rent", "amount_cents": 110000}),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["updated"], 2);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_budget_allocations_unknown_category() {
+        let cats = json!({
+            "category_groups": [{
+                "categories": [{"id": "c-groc", "name": "Groceries"}]
+            }]
+        });
+        let (base, h) = spawn_json_mock(vec![("/api/v1/categories".into(), 200, cats.to_string())]);
+        let api = BudgetApi::new(base);
+        let err = api
+            .set_budget_allocations(
+                "2026-07",
+                &[json!({"category": "NoSuch", "amount_cents": 1})],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, "unknown category 'NoSuch'");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_and_rollover_post_from_month() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/budgets/2026-08/copy".into(),
+                200,
+                json!({"copied": 1, "from": "2026-07", "month": "2026-08"}).to_string(),
+            ),
+            (
+                "/api/v1/budgets/2026-08/rollover".into(),
+                200,
+                json!({"rolled": 1, "from": "2026-07", "month": "2026-08"}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let copied = api.copy_budget("2026-08", "2026-07").await.unwrap();
+        assert_eq!(copied["copied"], 1);
+        let rolled = api.rollover_budget("2026-08", "2026-07").await.unwrap();
+        assert_eq!(rolled["rolled"], 1);
         h.join().unwrap();
     }
 }

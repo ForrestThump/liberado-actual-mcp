@@ -682,4 +682,81 @@ impl ActualServer {
             .map_err(McpError::internal)?;
         json_result(&v)
     }
+
+    #[tool("Set one category's monthly envelope allocation via Liberado Budget REST. \
+            category is id or name. month is YYYY-MM (e.g. 2026-09). \
+            amount_cents is integer cents (100 = $1.00).")]
+    async fn set_budget_amount(
+        &self,
+        month: String,
+        category: String,
+        amount_cents: i64,
+    ) -> McpResult<String> {
+        month_to_ym(&month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
+        })?;
+        let api = self.budget_writes()?;
+        let v = api
+            .set_budget_amount(&month, &category, amount_cents)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
+
+    #[tool("Set many category allocations for a month in one call via Liberado Budget REST. \
+            month is YYYY-MM. allocations is a JSON array of \
+            {category (id or name) or category_id, amount_cents}.")]
+    async fn set_budget_allocations(
+        &self,
+        month: String,
+        allocations: Vec<serde_json::Value>,
+    ) -> McpResult<String> {
+        month_to_ym(&month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
+        })?;
+        let api = self.budget_writes()?;
+        let v = api
+            .set_budget_allocations(&month, &allocations)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
+
+    #[tool("Copy envelope allocations from from_month into month (YYYY-MM). \
+            Copies budgeted amounts only; use rollover_budget to carry leftover balances.")]
+    async fn copy_budget(&self, month: String, from_month: String) -> McpResult<String> {
+        month_to_ym(&month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
+        })?;
+        month_to_ym(&from_month).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid from_month '{from_month}'; expected YYYY-MM"
+            ))
+        })?;
+        let api = self.budget_writes()?;
+        let v = api
+            .copy_budget(&month, &from_month)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
+
+    #[tool("Rollover leftover envelope balances from from_month into month (YYYY-MM). \
+            Remaining = budgeted + spent (spent is negative for expenses).")]
+    async fn rollover_budget(&self, month: String, from_month: String) -> McpResult<String> {
+        month_to_ym(&month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
+        })?;
+        month_to_ym(&from_month).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid from_month '{from_month}'; expected YYYY-MM"
+            ))
+        })?;
+        let api = self.budget_writes()?;
+        let v = api
+            .rollover_budget(&month, &from_month)
+            .await
+            .map_err(McpError::internal)?;
+        json_result(&v)
+    }
 }
