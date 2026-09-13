@@ -57,6 +57,10 @@ impl BudgetApi {
             .send()
             .await
             .map_err(|e| format!("budget API request failed: {e}"))?;
+        Self::json_response(resp).await
+    }
+
+    async fn json_response(resp: reqwest::Response) -> Result<Value, String> {
         let status = resp.status();
         let text = resp
             .text()
@@ -77,6 +81,23 @@ impl BudgetApi {
 
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
         self.send(reqwest::Method::POST, path, Some(body)).await
+    }
+
+    pub async fn post_text(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> Result<Value, String> {
+        let resp = self
+            .client
+            .request(reqwest::Method::POST, self.url(path))
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("budget API request failed: {e}"))?;
+        Self::json_response(resp).await
     }
 
     pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, String> {
@@ -353,6 +374,103 @@ impl BudgetApi {
         .await
     }
 
+    pub async fn list_loans(&self) -> Result<Value, String> {
+        self.get("/api/v1/loans").await
+    }
+
+    pub async fn loan_projection(
+        &self,
+        strategy: Option<&str>,
+        extra_cents: Option<i64>,
+    ) -> Result<Value, String> {
+        let strategy = parse_loan_strategy(strategy)?;
+        let extra = extra_cents.unwrap_or(0).max(0);
+        self.get(&format!(
+            "/api/v1/loans/projection?strategy={strategy}&extra_cents={extra}"
+        ))
+        .await
+    }
+
+    /// Import a statement via Liberado Budget REST.
+    ///
+    /// MCP cannot stream a raw HTTP body as a first-class file, so the cleanest
+    /// supported shape is: `csv` = raw CSV text (POSTed as `text/csv`), or
+    /// `inbox_file` = a filename already in the server's import inbox
+    /// (`POST /api/v1/import/inbox/{file}`). Exactly one of those is required.
+    /// `account` is id or name; `format` is auto|discover-card|discover-bank|generic.
+    pub async fn import_csv(
+        &self,
+        account: &str,
+        format: Option<&str>,
+        csv: Option<&str>,
+        inbox_file: Option<&str>,
+    ) -> Result<Value, String> {
+        let account_id = self.resolve_account(account).await?;
+        let format = parse_import_format(format)?;
+        let qs = format!(
+            "account_id={}&format={}",
+            encode_query(&account_id),
+            encode_query(format)
+        );
+        match (csv.map(str::trim).filter(|s| !s.is_empty()), inbox_file) {
+            (Some(csv), None) => {
+                self.post_text(&format!("/api/v1/import/csv?{qs}"), "text/csv", csv)
+                    .await
+            }
+            (None, Some(file)) => {
+                let file = parse_inbox_filename(file)?;
+                self.post(
+                    &format!("/api/v1/import/inbox/{}?{qs}", encode_query(&file)),
+                    &json!({}),
+                )
+                .await
+            }
+            (Some(_), Some(_)) => Err(
+                "import_csv: pass csv text or inbox_file, not both (csv is the MCP body; inbox_file is a server-side filename)"
+                    .into(),
+            ),
+            (None, None) => Err(
+                "import_csv: csv (raw CSV text) or inbox_file (Liberado Budget import-inbox filename) is required"
+                    .into(),
+            ),
+        }
+    }
+
+    pub async fn create_transfer(
+        &self,
+        from_account: &str,
+        to_account: &str,
+        date: &str,
+        amount_cents: i64,
+        notes: Option<&str>,
+        cleared: Option<bool>,
+    ) -> Result<Value, String> {
+        let from_account_id = self.resolve_account(from_account).await?;
+        let to_account_id = self.resolve_account(to_account).await?;
+        let mut body = json!({
+            "from_account_id": from_account_id,
+            "to_account_id": to_account_id,
+            "date": date,
+            "amount_cents": amount_cents,
+        });
+        if let Some(n) = notes {
+            body["notes"] = json!(n);
+        }
+        if let Some(c) = cleared {
+            body["cleared"] = json!(c);
+        }
+        self.post("/api/v1/transfers", &body).await
+    }
+
+    pub async fn pin_balance(&self, account: &str, balance_cents: i64) -> Result<Value, String> {
+        let id = self.resolve_account(account).await?;
+        self.post(
+            &format!("/api/v1/accounts/{id}/pin-balance"),
+            &json!({ "balance_cents": balance_cents }),
+        )
+        .await
+    }
+
     pub async fn resolve_category(&self, name_or_id: &str) -> Result<String, String> {
         let v = self.get("/api/v1/categories").await?;
         resolve_category_id(&v, name_or_id)
@@ -362,6 +480,11 @@ impl BudgetApi {
     pub async fn resolve_payee(&self, name_or_id: &str) -> Result<String, String> {
         let v = self.get("/api/v1/payees").await?;
         resolve_payee_id(&v, name_or_id).ok_or_else(|| format!("unknown payee '{name_or_id}'"))
+    }
+
+    pub async fn resolve_account(&self, name_or_id: &str) -> Result<String, String> {
+        let v = self.get("/api/v1/accounts").await?;
+        resolve_account_id(&v, name_or_id).ok_or_else(|| format!("unknown account '{name_or_id}'"))
     }
 
     async fn payees_for_ids(&self, ids: &[String]) -> Result<Vec<String>, String> {
@@ -469,6 +592,77 @@ pub fn resolve_payee_id(doc: &Value, name_or_id: &str) -> Option<String> {
         }
     }
     by_name
+}
+
+pub fn resolve_account_id(doc: &Value, name_or_id: &str) -> Option<String> {
+    let needle = name_or_id.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    let accounts = doc.get("accounts")?.as_array()?;
+    let mut by_name: Option<String> = None;
+    for a in accounts {
+        let id = a.get("id").and_then(|x| x.as_str())?;
+        let name = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        if id.eq_ignore_ascii_case(needle) {
+            return Some(id.to_string());
+        }
+        if name.eq_ignore_ascii_case(needle) {
+            by_name = Some(id.to_string());
+        }
+    }
+    by_name
+}
+
+pub fn parse_loan_strategy(s: Option<&str>) -> Result<&'static str, String> {
+    match s
+        .unwrap_or("avalanche")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "avalanche" => Ok("avalanche"),
+        "snowball" => Ok("snowball"),
+        other => Err(format!(
+            "strategy must be avalanche|snowball, got '{other}'"
+        )),
+    }
+}
+
+pub fn parse_import_format(s: Option<&str>) -> Result<&'static str, String> {
+    match s.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok("auto"),
+        "discover-card" => Ok("discover-card"),
+        "discover-bank" => Ok("discover-bank"),
+        "generic" => Ok("generic"),
+        other => Err(format!(
+            "format must be auto|discover-card|discover-bank|generic, got '{other}'"
+        )),
+    }
+}
+
+pub fn parse_inbox_filename(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("inbox_file is required".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("inbox_file must be a basename in the Liberado Budget import inbox".into());
+    }
+    Ok(name.to_string())
+}
+
+fn encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 pub fn find_equivalent_payee_rule(
@@ -804,6 +998,235 @@ mod tests {
         assert_eq!(copied["copied"], 1);
         let rolled = api.rollover_budget("2026-08", "2026-07").await.unwrap();
         assert_eq!(rolled["rolled"], 1);
+        h.join().unwrap();
+    }
+
+    fn sample_accounts() -> Value {
+        json!({
+            "accounts": [
+                {"id": "a-chk", "name": "Checking"},
+                {"id": "a-sav", "name": "Savings"},
+                {"id": "a-card", "name": "Discover Card"}
+            ]
+        })
+    }
+
+    #[test]
+    fn resolve_account_by_name_or_id() {
+        let doc = sample_accounts();
+        assert_eq!(
+            resolve_account_id(&doc, "checking").as_deref(),
+            Some("a-chk")
+        );
+        assert_eq!(resolve_account_id(&doc, "a-sav").as_deref(), Some("a-sav"));
+        assert!(resolve_account_id(&doc, "NoSuch").is_none());
+    }
+
+    #[test]
+    fn loan_strategy_and_import_format_parse() {
+        assert_eq!(parse_loan_strategy(None).unwrap(), "avalanche");
+        assert_eq!(parse_loan_strategy(Some("Snowball")).unwrap(), "snowball");
+        assert!(parse_loan_strategy(Some("minimums"))
+            .unwrap_err()
+            .contains("avalanche|snowball"));
+        assert_eq!(parse_import_format(None).unwrap(), "auto");
+        assert_eq!(
+            parse_import_format(Some("discover-bank")).unwrap(),
+            "discover-bank"
+        );
+        assert!(parse_import_format(Some("ofx"))
+            .unwrap_err()
+            .contains("discover-card"));
+        assert!(parse_inbox_filename("../x.csv").is_err());
+        assert_eq!(parse_inbox_filename("stmt.csv").unwrap(), "stmt.csv");
+    }
+
+    #[tokio::test]
+    async fn list_loans_gets_rest() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/loans".into(),
+            200,
+            json!({
+                "loans": [{
+                    "name": "Car",
+                    "apr_bps": 699,
+                    "min_payment_cents": 35000,
+                    "balance_cents": 1250000
+                }]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.list_loans().await.unwrap();
+        assert_eq!(v["loans"][0]["apr_bps"], 699);
+        assert_eq!(v["loans"][0]["min_payment_cents"], 35000);
+        assert_eq!(v["loans"][0]["balance_cents"], 1250000);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn loan_projection_gets_strategy_and_extra() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/loans/projection?strategy=snowball&extra_cents=20000".into(),
+            200,
+            json!({
+                "strategy": "snowball",
+                "extra_payment_cents": 20000,
+                "months_total": 18,
+                "total_interest_cents": 12345,
+                "truncated": false
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .loan_projection(Some("snowball"), Some(20000))
+            .await
+            .unwrap();
+        assert_eq!(v["strategy"], "snowball");
+        assert_eq!(v["extra_payment_cents"], 20000);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn loan_projection_rejects_bad_strategy() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let err = api.loan_projection(Some("foo"), Some(0)).await.unwrap_err();
+        assert!(err.contains("avalanche|snowball"));
+    }
+
+    #[tokio::test]
+    async fn import_csv_posts_text_body_after_account_resolve() {
+        let csv = "Date,Description,Amount\n2026-09-01,Coffee,-4.50\n";
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+            ),
+            (
+                "/api/v1/import/csv?account_id=a-chk&format=generic".into(),
+                200,
+                json!({
+                    "report": {
+                        "format": "generic",
+                        "inserted": 1,
+                        "skipped": 0,
+                        "errors": []
+                    },
+                    "rules_matched": 0
+                })
+                .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .import_csv("Checking", Some("generic"), Some(csv), None)
+            .await
+            .unwrap();
+        assert_eq!(v["report"]["inserted"], 1);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_csv_inbox_file_posts_server_path() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+            ),
+            (
+                "/api/v1/import/inbox/stmt.csv?account_id=a-chk&format=auto".into(),
+                200,
+                json!({"file": "stmt.csv", "report": {"inserted": 2}}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .import_csv("Checking", None, None, Some("stmt.csv"))
+            .await
+            .unwrap();
+        assert_eq!(v["file"], "stmt.csv");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_csv_requires_csv_or_inbox() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let err = api
+            .import_csv("Checking", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("csv"));
+        let err = api
+            .import_csv("Checking", None, Some("a,b"), Some("x.csv"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not both"));
+    }
+
+    #[tokio::test]
+    async fn create_transfer_resolves_accounts_then_posts() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+            ),
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+            ),
+            (
+                "/api/v1/transfers".into(),
+                201,
+                json!({
+                    "from_transaction_id": "t-from",
+                    "to_transaction_id": "t-to"
+                })
+                .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .create_transfer(
+                "Checking",
+                "Savings",
+                "2026-09-01",
+                25000,
+                Some("save"),
+                Some(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["from_transaction_id"], "t-from");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pin_balance_posts_cents() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+            ),
+            (
+                "/api/v1/accounts/a-chk/pin-balance".into(),
+                200,
+                json!({
+                    "opening_cents": 100000,
+                    "activity_cents": 5000,
+                    "balance_cents": 105000
+                })
+                .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.pin_balance("Checking", 105000).await.unwrap();
+        assert_eq!(v["balance_cents"], 105000);
         h.join().unwrap();
     }
 }

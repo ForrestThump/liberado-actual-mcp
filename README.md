@@ -24,6 +24,8 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `transactions_by_category` | Newest transactions whose category name matches a regex |
 | `budget_api_uncategorized` | Same as uncategorized_transactions, live from Liberado Budget REST |
 | `budget_api_transactions_by_category` | Category-regex transactions from Liberado Budget REST |
+| `list_loans` | Registered loans (balances, APR bps, min payments) from Liberado Budget REST |
+| `loan_projection` | Avalanche/snowball payoff projection (`strategy`, `extra_cents`) |
 | `balance_history` | Month-by-month running account balance |
 | `net_worth` | Total balance across all on-budget accounts |
 | `get_rules` | Auto-categorisation rules with parsed conditions and actions |
@@ -48,6 +50,9 @@ Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Bu
 | `set_budget_allocations` | Set many allocations for a month (`[{category, amount_cents}, ...]`) |
 | `copy_budget` | Copy allocations from `from_month` into `month` |
 | `rollover_budget` | Carry leftover envelope balances from `from_month` into `month` |
+| `import_csv` | Import a bank/card CSV (`account`, `format`, `csv` text or `inbox_file`) |
+| `create_transfer` | Linked transfer between two accounts (`amount_cents`) |
+| `pin_balance` | Back-adjust starting balance so ledger equals `balance_cents` |
 
 Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
 
@@ -74,6 +79,44 @@ invalid-params errors. Examples:
 
 ```json
 { "month": "2026-10", "from_month": "2026-09" }
+```
+
+Debt and import tools also go through REST (`list_loans` / `loan_projection` are
+reads of Liberado-only tables, not `ACTUAL_DB_PATH`). Money is integer cents.
+`loan_projection` takes `strategy` (`avalanche` default, or `snowball`) and
+optional `extra_cents` (extra monthly payment; default 0).
+
+`import_csv` posts raw CSV — the REST API is `POST /api/v1/import/csv?account_id=&format=`
+with a `text/csv` body, which is awkward as a JSON file upload, so the MCP
+parameter is the CSV text itself (`csv`). `account` is id or name. `format` is
+`auto` (default), `discover-card`, `discover-bank`, or `generic`. To import a
+file already in the Liberado Budget import inbox, pass `inbox_file` (basename
+only) instead of `csv`. After a Discover bank import, `statement_balance_cents`
+is the suggested `pin_balance` target.
+
+```json
+{
+  "account": "Checking",
+  "format": "generic",
+  "csv": "Date,Description,Amount\n2026-09-01,Coffee,-4.50\n"
+}
+```
+
+```json
+{ "account": "Checking", "inbox_file": "stmt.csv" }
+```
+
+```json
+{
+  "from_account": "Checking",
+  "to_account": "Savings",
+  "date": "2026-09-01",
+  "amount_cents": 25000
+}
+```
+
+```json
+{ "account": "Checking", "balance_cents": 105000 }
 ```
 
 ### `get_transactions` parameters

@@ -23,8 +23,11 @@ fn budget_api_error(e: String) -> McpError {
         McpError::permission_denied(e)
     } else if e.starts_with("budget API 4") {
         McpError::invalid_params(e)
-    } else {
+    } else if e.starts_with("budget API ") {
         McpError::internal(e)
+    } else {
+        // Client-side validation (unknown account/category, bad strategy, …)
+        McpError::invalid_params(e)
     }
 }
 
@@ -822,6 +825,114 @@ impl ActualServer {
         let api = self.budget_writes()?;
         let v = api
             .rollover_budget(&month, &from_month)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "List registered loans from Liberado Budget REST (requires LIBERADO_BUDGET_API_URL). \
+            Returns name, apr_bps (basis points; 699 = 6.99%), min_payment_cents, \
+            and balance_cents (positive payoff amount). Not available via ACTUAL_DB_PATH."
+    )]
+    async fn list_loans(&self) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api.list_loans().await.map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Project loan payoff via Liberado Budget REST (requires LIBERADO_BUDGET_API_URL). \
+            strategy is avalanche (highest APR first, default) or snowball (smallest balance first). \
+            extra_cents is optional extra monthly payment in integer cents (default 0)."
+    )]
+    async fn loan_projection(
+        &self,
+        strategy: Option<String>,
+        extra_cents: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .loan_projection(strategy.as_deref(), extra_cents)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Import a bank/card CSV via Liberado Budget REST (requires LIBERADO_BUDGET_API_URL). \
+            account is id or name. format is auto (default), discover-card, discover-bank, or generic. \
+            Pass csv as the raw CSV text (POSTed as text/csv) — the cleanest MCP shape, since \
+            the REST API takes a raw body rather than a JSON string. \
+            Alternatively pass inbox_file as a basename already in the server import inbox \
+            (POST /api/v1/import/inbox/{file}); do not pass both. \
+            Response includes inserted/skipped/errors and optional statement_balance_cents \
+            (use pin_balance after Discover bank imports)."
+    )]
+    async fn import_csv(
+        &self,
+        account: String,
+        format: Option<String>,
+        csv: Option<String>,
+        inbox_file: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .import_csv(
+                &account,
+                format.as_deref(),
+                csv.as_deref(),
+                inbox_file.as_deref(),
+            )
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Create a linked transfer between two accounts via Liberado Budget REST. \
+            from_account and to_account are id or name. date is YYYY-MM-DD. \
+            amount_cents is integer cents moved from from_account to to_account. \
+            notes and cleared are optional."
+    )]
+    async fn create_transfer(
+        &self,
+        from_account: String,
+        to_account: String,
+        date: String,
+        amount_cents: i64,
+        notes: Option<String>,
+        cleared: Option<bool>,
+    ) -> McpResult<String> {
+        date_str_to_int(&date).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid date '{date}'; expected YYYY-MM-DD"))
+        })?;
+        let api = self.budget_writes()?;
+        let v = api
+            .create_transfer(
+                &from_account,
+                &to_account,
+                &date,
+                amount_cents,
+                notes.as_deref(),
+                cleared,
+            )
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Pin an account's ledger balance via Liberado Budget REST. \
+            account is id or name. balance_cents is today's desired ledger balance \
+            (integer cents; credit/loan owed is typically negative). \
+            Back-adjusts the Starting Balance row so opening + activity = balance_cents. \
+            Use after import_csv when the response includes statement_balance_cents."
+    )]
+    async fn pin_balance(&self, account: String, balance_cents: i64) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .pin_balance(&account, balance_cents)
             .await
             .map_err(budget_api_error)?;
         json_result(&v)
