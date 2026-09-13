@@ -3,9 +3,12 @@ use regex::Regex;
 /// Returns true when `pattern` contains regex metacharacters and should be
 /// interpreted as a full regex rather than a plain substring.
 fn has_regex_metacharacters(pattern: &str) -> bool {
-    pattern
-        .chars()
-        .any(|c| matches!(c, '.' | '*' | '+' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '^' | '$' | '\\'))
+    pattern.chars().any(|c| {
+        matches!(
+            c,
+            '.' | '*' | '+' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '^' | '$' | '\\'
+        )
+    })
 }
 
 /// Case-insensitive match of `haystack` against `pattern`.

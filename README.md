@@ -44,8 +44,37 @@ Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Bu
 | `categorize_transactions` | Bulk-assign category; optional learn-from-payees |
 | `create_payee_rule` | Create a payee-regex auto-categorisation rule |
 | `apply_rules` | Re-run rules on uncategorized transactions |
+| `set_budget_amount` | Set one category's monthly envelope allocation (`month`, `category` id or name, `amount_cents`) |
+| `set_budget_allocations` | Set many allocations for a month (`[{category, amount_cents}, ...]`) |
+| `copy_budget` | Copy allocations from `from_month` into `month` |
+| `rollover_budget` | Carry leftover envelope balances from `from_month` into `month` |
 
 Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
+
+Envelope amounts are integer cents. **Income categories store their target as a
+negative value on the backend** (so `balance = budgeted + actual` holds with
+Actual's sign convention). Pass a *positive* `amount_cents` to these tools; a
+later readback via `get_budget_month` shows the negative target. Backend
+rejections (e.g. unknown category, invalid month) are returned as MCP
+invalid-params errors. Examples:
+
+```json
+{ "month": "2026-09", "category": "Groceries", "amount_cents": 50000 }
+```
+
+```json
+{
+  "month": "2026-09",
+  "allocations": [
+    { "category": "Groceries", "amount_cents": 50000 },
+    { "category_id": "c-rent", "amount_cents": 150000 }
+  ]
+}
+```
+
+```json
+{ "month": "2026-10", "from_month": "2026-09" }
+```
 
 ### `get_transactions` parameters
 
