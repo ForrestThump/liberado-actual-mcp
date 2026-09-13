@@ -405,34 +405,42 @@ impl BudgetApi {
         csv: Option<&str>,
         inbox_file: Option<&str>,
     ) -> Result<Value, String> {
-        let account_id = self.resolve_account(account).await?;
+        let csv = csv.map(str::trim).filter(|s| !s.is_empty());
+        let source = match (csv, inbox_file) {
+            (Some(csv), None) => ImportSource::Csv(csv),
+            (None, Some(file)) => ImportSource::Inbox(parse_inbox_filename(file)?),
+            (Some(_), Some(_)) => {
+                return Err(
+                    "import_csv: pass csv text or inbox_file, not both (csv is the MCP body; inbox_file is a server-side filename)"
+                        .into(),
+                );
+            }
+            (None, None) => {
+                return Err(
+                    "import_csv: csv (raw CSV text) or inbox_file (Liberado Budget import-inbox filename) is required"
+                        .into(),
+                );
+            }
+        };
         let format = parse_import_format(format)?;
+        let account_id = self.resolve_account(account).await?;
         let qs = format!(
             "account_id={}&format={}",
             encode_query(&account_id),
             encode_query(format)
         );
-        match (csv.map(str::trim).filter(|s| !s.is_empty()), inbox_file) {
-            (Some(csv), None) => {
+        match source {
+            ImportSource::Csv(csv) => {
                 self.post_text(&format!("/api/v1/import/csv?{qs}"), "text/csv", csv)
                     .await
             }
-            (None, Some(file)) => {
-                let file = parse_inbox_filename(file)?;
+            ImportSource::Inbox(file) => {
                 self.post(
                     &format!("/api/v1/import/inbox/{}?{qs}", encode_query(&file)),
                     &json!({}),
                 )
                 .await
             }
-            (Some(_), Some(_)) => Err(
-                "import_csv: pass csv text or inbox_file, not both (csv is the MCP body; inbox_file is a server-side filename)"
-                    .into(),
-            ),
-            (None, None) => Err(
-                "import_csv: csv (raw CSV text) or inbox_file (Liberado Budget import-inbox filename) is required"
-                    .into(),
-            ),
         }
     }
 
@@ -508,6 +516,11 @@ impl BudgetApi {
         payees.dedup();
         Ok(payees)
     }
+}
+
+enum ImportSource<'a> {
+    Csv(&'a str),
+    Inbox(String),
 }
 
 /// Parse MCP/REST allocation objects. Each item needs `amount_cents` and either
