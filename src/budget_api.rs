@@ -4,8 +4,12 @@
 //! read-write. Base URL comes from `LIBERADO_BUDGET_API_URL`.
 
 use serde_json::{json, Value};
+
+#[cfg(test)]
 use std::io::{Read, Write};
+#[cfg(test)]
 use std::net::TcpListener;
+#[cfg(test)]
 use std::thread;
 
 #[derive(Clone)]
