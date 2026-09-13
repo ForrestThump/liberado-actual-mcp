@@ -55,7 +55,7 @@ pub struct Account {
 #[derive(Debug, Serialize)]
 pub struct Transaction {
     pub id: String,
-    pub date: String,        // "YYYY-MM-DD"
+    pub date: String, // "YYYY-MM-DD"
     pub amount_cents: i64,
     pub amount_display: String,
     pub payee: String,
@@ -187,11 +187,15 @@ pub fn date_int_to_str(d: i64) -> String {
 pub fn date_str_to_int(s: &str) -> Option<i64> {
     // Accepts "YYYY-MM-DD"
     let parts: Vec<&str> = s.splitn(3, '-').collect();
-    if parts.len() != 3 { return None; }
+    if parts.len() != 3 {
+        return None;
+    }
     let y: i64 = parts[0].parse().ok()?;
     let m: i64 = parts[1].parse().ok()?;
     let d: i64 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
     Some(y * 10000 + m * 100 + d)
 }
 
@@ -212,10 +216,14 @@ pub fn month_to_ym(month: &str) -> Option<i64> {
 // First and last day of month as YYYYMMDD integers, given "YYYY-MM".
 pub fn month_bounds(month: &str) -> Option<(i64, i64)> {
     let parts: Vec<&str> = month.splitn(2, '-').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     let y: i64 = parts[0].parse().ok()?;
     let m: i64 = parts[1].parse().ok()?;
-    if !(1..=12).contains(&m) { return None; }
+    if !(1..=12).contains(&m) {
+        return None;
+    }
     let start = y * 10000 + m * 100 + 1;
     let (next_y, next_m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     let end = next_y * 10000 + next_m * 100 + 1;

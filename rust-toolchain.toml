@@ -1,0 +1,5 @@
+# Pinned compiler for CI and local dev — matches the Dockerfile's
+# rust:1.94-slim-bookworm builder. Bump together with CI lint fixes.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

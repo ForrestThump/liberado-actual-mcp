@@ -34,7 +34,10 @@ fn origin_policy() -> ServerConfig {
                 .filter(|o| !o.is_empty())
                 .collect();
             tracing::info!(?origins, "MCP origin validation: allow-listed");
-            builder.allow_origins(origins).allow_any_origin(false).build()
+            builder
+                .allow_origins(origins)
+                .allow_any_origin(false)
+                .build()
         }
         _ => {
             tracing::info!(
@@ -50,7 +53,9 @@ fn origin_policy() -> ServerConfig {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Log to stderr: in STDIO transport mode stdout carries the MCP JSON-RPC
     // stream, so any log line on stdout would corrupt the protocol.
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let server = ActualServer::new()?;
     // An unset *or empty* BIND_ADDR means STDIO transport.
     match std::env::var("BIND_ADDR").ok().filter(|s| !s.is_empty()) {
@@ -66,7 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
         }
         None => {
-            server.builder().transport(Transport::stdio()).serve().await?;
+            server
+                .builder()
+                .transport(Transport::stdio())
+                .serve()
+                .await?;
         }
     }
     Ok(())

@@ -1,7 +1,7 @@
+use secrecy::{ExposeSecret, SecretString};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 use turbomcp::prelude::*;
-use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     actual::{find_budget_file, ActualClient, SQLITE_MAGIC},
@@ -12,6 +12,20 @@ use crate::{
 
 fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
     serde_json::to_string_pretty(val).map_err(|e| McpError::internal(e.to_string()))
+}
+
+/// Map a Liberado Budget REST error (from `BudgetApi::send`) to the right MCP
+/// error kind. `send` formats non-2xx as `budget API {status}: {text}`, so
+/// client errors (4xx) surface as invalid-params / permission-denied instead of
+/// a generic internal error, which agents cannot act on.
+fn budget_api_error(e: String) -> McpError {
+    if e.starts_with("budget API 401") || e.starts_with("budget API 403") {
+        McpError::permission_denied(e)
+    } else if e.starts_with("budget API 4") {
+        McpError::invalid_params(e)
+    } else {
+        McpError::internal(e)
+    }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -126,7 +140,11 @@ impl ActualServer {
                     _temp_file: None,
                 }
             }
-            BudgetSource::Server { client, password, budget_id } => {
+            BudgetSource::Server {
+                client,
+                password,
+                budget_id,
+            } => {
                 let token = client
                     .login(password.expose_secret())
                     .await
@@ -222,14 +240,18 @@ impl ActualServer {
         json_result(&self.query(db::list_accounts).await?)
     }
 
-    #[tool("Get transactions for an account. account_id is optional (omit for all accounts). \
+    #[tool(
+        "Get transactions for an account. account_id is optional (omit for all accounts). \
             start_date and end_date are optional ISO dates (YYYY-MM-DD). \
             limit caps the number returned (default 500, max 2000). \
             min_amount_cents and max_amount_cents filter by amount in cents \
             (e.g. max_amount_cents=-1 returns only expenses; amounts are negative for debits). \
             category filters by category name or id (exact match, case-insensitive). \
             payee filters by payee name (partial, case-insensitive). \
-            notes filters by memo/notes text (partial, case-insensitive).")]
+            notes filters by memo/notes text (partial, case-insensitive)."
+    )]
+    // Pre-existing: mirrors the 10 filter params of db::get_transactions.
+    #[allow(clippy::too_many_arguments)]
     async fn get_transactions(
         &self,
         account_id: Option<String>,
@@ -246,7 +268,9 @@ impl ActualServer {
             .as_deref()
             .map(|d| {
                 date_str_to_int(d).ok_or_else(|| {
-                    McpError::invalid_params(format!("Invalid start_date '{d}'; expected YYYY-MM-DD"))
+                    McpError::invalid_params(format!(
+                        "Invalid start_date '{d}'; expected YYYY-MM-DD"
+                    ))
                 })
             })
             .transpose()?;
@@ -289,8 +313,10 @@ impl ActualServer {
         json_result(&self.query(db::list_payees).await?)
     }
 
-    #[tool("Get the budget and actual spending for each category in a month. \
-            month format: YYYY-MM (e.g. 2024-03)")]
+    #[tool(
+        "Get the budget and actual spending for each category in a month. \
+            month format: YYYY-MM (e.g. 2024-03)"
+    )]
     async fn get_budget_month(&self, month: String) -> McpResult<String> {
         let (start, end) = month_bounds(&month).ok_or_else(|| {
             McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
@@ -302,15 +328,15 @@ impl ActualServer {
         )
     }
 
-    #[tool("Summarize income, expenses, and net savings month by month. \
-            start_month and end_month use YYYY-MM format (e.g. 2024-01 to 2024-12).")]
-    async fn monthly_summary(
-        &self,
-        start_month: String,
-        end_month: String,
-    ) -> McpResult<String> {
+    #[tool(
+        "Summarize income, expenses, and net savings month by month. \
+            start_month and end_month use YYYY-MM format (e.g. 2024-01 to 2024-12)."
+    )]
+    async fn monthly_summary(&self, start_month: String, end_month: String) -> McpResult<String> {
         let (start_date, _) = month_bounds(&start_month).ok_or_else(|| {
-            McpError::invalid_params(format!("Invalid start_month '{start_month}'; expected YYYY-MM"))
+            McpError::invalid_params(format!(
+                "Invalid start_month '{start_month}'; expected YYYY-MM"
+            ))
         })?;
         let (_, end_date) = month_bounds(&end_month).ok_or_else(|| {
             McpError::invalid_params(format!("Invalid end_month '{end_month}'; expected YYYY-MM"))
@@ -322,82 +348,11 @@ impl ActualServer {
         )
     }
 
-    #[tool("Aggregate spending by category between two dates (YYYY-MM-DD). \
-            Only expense transactions (negative amounts) are included.")]
+    #[tool(
+        "Aggregate spending by category between two dates (YYYY-MM-DD). \
+            Only expense transactions (negative amounts) are included."
+    )]
     async fn spending_by_category(
-        &self,
-        start_date: String,
-        end_date: String,
-    ) -> McpResult<String> {
-        let start = date_str_to_int(&start_date).ok_or_else(|| {
-            McpError::invalid_params(format!("Invalid start_date '{start_date}'; expected YYYY-MM-DD"))
-        })?;
-        let end = date_str_to_int(&end_date).ok_or_else(|| {
-            McpError::invalid_params(format!("Invalid end_date '{end_date}'; expected YYYY-MM-DD"))
-        })?;
-        json_result(&self.query(move |p| db::spending_by_category(p, start, end)).await?)
-    }
-
-    #[tool("Re-download the latest budget data from the Actual Budget server (server mode only). \
-            In local mode this is a no-op and just confirms the file path.")]
-    async fn refresh(&self) -> McpResult<String> {
-        // Drop the cache entry; in-flight queries hold their own Arc so their
-        // temp files stay alive until those tasks complete.
-        {
-            let mut w = self.state.cache.write().await;
-            *w = None;
-        }
-        let cache = self.db_cache().await?;
-        Ok(format!("Budget loaded from: {}", cache.db_path.display()))
-    }
-
-    #[tool("Return the net worth across all non-closed, on-budget accounts")]
-    async fn net_worth(&self) -> McpResult<String> {
-        let total = self.query(db::net_worth).await?;
-        Ok(format!("Net worth (on-budget accounts): {}", format_amount(total)))
-    }
-
-    #[tool("Get the month-by-month running balance for an account. \
-            account_id is optional (omit to aggregate across all accounts, including off-budget). \
-            start_month and end_month use YYYY-MM format. \
-            balance_cents reflects the true cumulative balance from account opening, \
-            not just from start_month. Months with no transactions are omitted.")]
-    async fn balance_history(
-        &self,
-        account_id: Option<String>,
-        start_month: String,
-        end_month: String,
-    ) -> McpResult<String> {
-        let start_ym = month_to_ym(&start_month).ok_or_else(|| {
-            McpError::invalid_params(format!(
-                "Invalid start_month '{start_month}'; expected YYYY-MM"
-            ))
-        })?;
-        let end_ym = month_to_ym(&end_month).ok_or_else(|| {
-            McpError::invalid_params(format!(
-                "Invalid end_month '{end_month}'; expected YYYY-MM"
-            ))
-        })?;
-        json_result(
-            &self
-                .query(move |p| db::balance_history(p, account_id.as_deref(), start_ym, end_ym))
-                .await?,
-        )
-    }
-
-    #[tool("List all transaction auto-categorisation rules. \
-            Each rule has conditions (criteria to match transactions) and actions \
-            (fields to set when matched). conditions and actions are JSON arrays. \
-            stage is 'pre', 'post', or null (default/main execution order).")]
-    async fn get_rules(&self) -> McpResult<String> {
-        json_result(&self.query(db::get_rules).await?)
-    }
-
-    #[tool("Aggregate expense spending by payee between two dates (YYYY-MM-DD). \
-            Only expense transactions (negative amounts) are included. \
-            Split transactions are attributed to the payee on the parent row, \
-            so each purchase is counted once. Results are ordered most-spent first.")]
-    async fn spending_by_payee(
         &self,
         start_date: String,
         end_date: String,
@@ -412,16 +367,108 @@ impl ActualServer {
                 "Invalid end_date '{end_date}'; expected YYYY-MM-DD"
             ))
         })?;
-        json_result(&self.query(move |p| db::spending_by_payee(p, start, end)).await?)
+        json_result(
+            &self
+                .query(move |p| db::spending_by_category(p, start, end))
+                .await?,
+        )
     }
 
-    #[tool("Return transactions with no category or the reserved Uncategorized category. \
+    #[tool(
+        "Re-download the latest budget data from the Actual Budget server (server mode only). \
+            In local mode this is a no-op and just confirms the file path."
+    )]
+    async fn refresh(&self) -> McpResult<String> {
+        // Drop the cache entry; in-flight queries hold their own Arc so their
+        // temp files stay alive until those tasks complete.
+        {
+            let mut w = self.state.cache.write().await;
+            *w = None;
+        }
+        let cache = self.db_cache().await?;
+        Ok(format!("Budget loaded from: {}", cache.db_path.display()))
+    }
+
+    #[tool("Return the net worth across all non-closed, on-budget accounts")]
+    async fn net_worth(&self) -> McpResult<String> {
+        let total = self.query(db::net_worth).await?;
+        Ok(format!(
+            "Net worth (on-budget accounts): {}",
+            format_amount(total)
+        ))
+    }
+
+    #[tool(
+        "Get the month-by-month running balance for an account. \
+            account_id is optional (omit to aggregate across all accounts, including off-budget). \
+            start_month and end_month use YYYY-MM format. \
+            balance_cents reflects the true cumulative balance from account opening, \
+            not just from start_month. Months with no transactions are omitted."
+    )]
+    async fn balance_history(
+        &self,
+        account_id: Option<String>,
+        start_month: String,
+        end_month: String,
+    ) -> McpResult<String> {
+        let start_ym = month_to_ym(&start_month).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid start_month '{start_month}'; expected YYYY-MM"
+            ))
+        })?;
+        let end_ym = month_to_ym(&end_month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid end_month '{end_month}'; expected YYYY-MM"))
+        })?;
+        json_result(
+            &self
+                .query(move |p| db::balance_history(p, account_id.as_deref(), start_ym, end_ym))
+                .await?,
+        )
+    }
+
+    #[tool(
+        "List all transaction auto-categorisation rules. \
+            Each rule has conditions (criteria to match transactions) and actions \
+            (fields to set when matched). conditions and actions are JSON arrays. \
+            stage is 'pre', 'post', or null (default/main execution order)."
+    )]
+    async fn get_rules(&self) -> McpResult<String> {
+        json_result(&self.query(db::get_rules).await?)
+    }
+
+    #[tool(
+        "Aggregate expense spending by payee between two dates (YYYY-MM-DD). \
+            Only expense transactions (negative amounts) are included. \
+            Split transactions are attributed to the payee on the parent row, \
+            so each purchase is counted once. Results are ordered most-spent first."
+    )]
+    async fn spending_by_payee(&self, start_date: String, end_date: String) -> McpResult<String> {
+        let start = date_str_to_int(&start_date).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid start_date '{start_date}'; expected YYYY-MM-DD"
+            ))
+        })?;
+        let end = date_str_to_int(&end_date).ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Invalid end_date '{end_date}'; expected YYYY-MM-DD"
+            ))
+        })?;
+        json_result(
+            &self
+                .query(move |p| db::spending_by_payee(p, start, end))
+                .await?,
+        )
+    }
+
+    #[tool(
+        "Return transactions with no category or the reserved Uncategorized category. \
             Split parent rows are excluded because their NULL category is intentional — \
             the real categories live on their child rows. \
             account_id is optional (omit for all accounts). \
             start_date and end_date are optional ISO dates (YYYY-MM-DD). \
             limit caps the number returned (default 200, max 2000). \
-            For live data from the Liberado Budget server, use budget_api_uncategorized.")]
+            For live data from the Liberado Budget server, use budget_api_uncategorized."
+    )]
     async fn uncategorized_transactions(
         &self,
         account_id: Option<String>,
@@ -443,9 +490,7 @@ impl ActualServer {
             .as_deref()
             .map(|d| {
                 date_str_to_int(d).ok_or_else(|| {
-                    McpError::invalid_params(format!(
-                        "Invalid end_date '{d}'; expected YYYY-MM-DD"
-                    ))
+                    McpError::invalid_params(format!("Invalid end_date '{d}'; expected YYYY-MM-DD"))
                 })
             })
             .transpose()?;
@@ -459,11 +504,13 @@ impl ActualServer {
         )
     }
 
-    #[tool("Return recent transactions whose category name matches category_regex. \
+    #[tool(
+        "Return recent transactions whose category name matches category_regex. \
             Plain text matches as case-insensitive substring; metacharacters are full regex. \
             account_id is optional (omit for all accounts). \
             start_date and end_date are optional ISO dates (YYYY-MM-DD). \
-            limit caps the number returned (default 500, max 2000).")]
+            limit caps the number returned (default 500, max 2000)."
+    )]
     async fn transactions_by_category(
         &self,
         category_regex: String,
@@ -486,9 +533,7 @@ impl ActualServer {
             .as_deref()
             .map(|d| {
                 date_str_to_int(d).ok_or_else(|| {
-                    McpError::invalid_params(format!(
-                        "Invalid end_date '{d}'; expected YYYY-MM-DD"
-                    ))
+                    McpError::invalid_params(format!("Invalid end_date '{d}'; expected YYYY-MM-DD"))
                 })
             })
             .transpose()?;
@@ -510,9 +555,11 @@ impl ActualServer {
         )
     }
 
-    #[tool("Return uncategorized transactions from the Liberado Budget REST API \
+    #[tool(
+        "Return uncategorized transactions from the Liberado Budget REST API \
             (requires LIBERADO_BUDGET_API_URL). Same filters as uncategorized_transactions \
-            but reads live server data when SQLite may be stale.")]
+            but reads live server data when SQLite may be stale."
+    )]
     async fn budget_api_uncategorized(
         &self,
         account_id: Option<String>,
@@ -533,9 +580,11 @@ impl ActualServer {
         json_result(&v)
     }
 
-    #[tool("Return transactions whose category name matches category_regex from the \
+    #[tool(
+        "Return transactions whose category name matches category_regex from the \
             Liberado Budget REST API (requires LIBERADO_BUDGET_API_URL). \
-            Plain text matches as case-insensitive substring.")]
+            Plain text matches as case-insensitive substring."
+    )]
     async fn budget_api_transactions_by_category(
         &self,
         category_regex: String,
@@ -558,8 +607,10 @@ impl ActualServer {
         json_result(&v)
     }
 
-    #[tool("Create an envelope category. kind is expense (default) or income. \
-            group_name is optional (defaults to Expenses/Income).")]
+    #[tool(
+        "Create an envelope category. kind is expense (default) or income. \
+            group_name is optional (defaults to Expenses/Income)."
+    )]
     async fn create_category(
         &self,
         name: String,
@@ -623,8 +674,10 @@ impl ActualServer {
         json_result(&serde_json::json!({ "updated": transaction_id }))
     }
 
-    #[tool("Assign a category (id or name) to many transactions. \
-            learn=true also creates a payee-regex rule from those payees.")]
+    #[tool(
+        "Assign a category (id or name) to many transactions. \
+            learn=true also creates a payee-regex rule from those payees."
+    )]
     async fn categorize_transactions(
         &self,
         transaction_ids: Vec<String>,
@@ -639,7 +692,9 @@ impl ActualServer {
         json_result(&v)
     }
 
-    #[tool("Set a transaction's payee by display name (creates or matches, like Actual payee_name).")]
+    #[tool(
+        "Set a transaction's payee by display name (creates or matches, like Actual payee_name)."
+    )]
     async fn set_transaction_payee(
         &self,
         transaction_id: String,
@@ -652,14 +707,12 @@ impl ActualServer {
         json_result(&serde_json::json!({ "updated": transaction_id, "payee": payee }))
     }
 
-    #[tool("Create a rule: payee matches this regex (plain text = case-insensitive substring) \
+    #[tool(
+        "Create a rule: payee matches this regex (plain text = case-insensitive substring) \
             → set category (id or name). Auto-applies to uncategorized transactions; \
-            response includes matched count. Idempotent: does not duplicate an equivalent rule.")]
-    async fn create_payee_rule(
-        &self,
-        payee_regex: String,
-        category: String,
-    ) -> McpResult<String> {
+            response includes matched count. Idempotent: does not duplicate an equivalent rule."
+    )]
+    async fn create_payee_rule(&self, payee_regex: String, category: String) -> McpResult<String> {
         let api = self.budget_writes()?;
         let v = api
             .create_payee_rule(&payee_regex, &category)
@@ -668,8 +721,10 @@ impl ActualServer {
         json_result(&v)
     }
 
-    #[tool("Apply auto-categorisation rules to transactions with no category or the \
-            reserved Uncategorized category. Returns matched count.")]
+    #[tool(
+        "Apply auto-categorisation rules to transactions with no category or the \
+            reserved Uncategorized category. Returns matched count."
+    )]
     async fn apply_rules(
         &self,
         account_id: Option<String>,
@@ -683,9 +738,13 @@ impl ActualServer {
         json_result(&v)
     }
 
-    #[tool("Set one category's monthly envelope allocation via Liberado Budget REST. \
+    #[tool(
+        "Set one category's monthly envelope allocation via Liberado Budget REST. \
             category is id or name. month is YYYY-MM (e.g. 2026-09). \
-            amount_cents is integer cents (100 = $1.00).")]
+            amount_cents is integer cents (100 = $1.00). \
+            Income categories store their target as a negative value on the backend; \
+            pass a positive amount_cents and readback via get_budget_month will be negative."
+    )]
     async fn set_budget_amount(
         &self,
         month: String,
@@ -699,13 +758,17 @@ impl ActualServer {
         let v = api
             .set_budget_amount(&month, &category, amount_cents)
             .await
-            .map_err(McpError::internal)?;
+            .map_err(budget_api_error)?;
         json_result(&v)
     }
 
-    #[tool("Set many category allocations for a month in one call via Liberado Budget REST. \
+    #[tool(
+        "Set many category allocations for a month in one call via Liberado Budget REST. \
             month is YYYY-MM. allocations is a JSON array of \
-            {category (id or name) or category_id, amount_cents}.")]
+            {category (id or name) or category_id, amount_cents}. \
+            Income categories store their target as a negative value on the backend; \
+            pass positive amount_cents and readback via get_budget_month will be negative."
+    )]
     async fn set_budget_allocations(
         &self,
         month: String,
@@ -718,12 +781,14 @@ impl ActualServer {
         let v = api
             .set_budget_allocations(&month, &allocations)
             .await
-            .map_err(McpError::internal)?;
+            .map_err(budget_api_error)?;
         json_result(&v)
     }
 
-    #[tool("Copy envelope allocations from from_month into month (YYYY-MM). \
-            Copies budgeted amounts only; use rollover_budget to carry leftover balances.")]
+    #[tool(
+        "Copy envelope allocations from from_month into month (YYYY-MM). \
+            Copies budgeted amounts only; use rollover_budget to carry leftover balances."
+    )]
     async fn copy_budget(&self, month: String, from_month: String) -> McpResult<String> {
         month_to_ym(&month).ok_or_else(|| {
             McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
@@ -737,12 +802,14 @@ impl ActualServer {
         let v = api
             .copy_budget(&month, &from_month)
             .await
-            .map_err(McpError::internal)?;
+            .map_err(budget_api_error)?;
         json_result(&v)
     }
 
-    #[tool("Rollover leftover envelope balances from from_month into month (YYYY-MM). \
-            Remaining = budgeted + spent (spent is negative for expenses).")]
+    #[tool(
+        "Rollover leftover envelope balances from from_month into month (YYYY-MM). \
+            Remaining = budgeted + spent (spent is negative for expenses)."
+    )]
     async fn rollover_budget(&self, month: String, from_month: String) -> McpResult<String> {
         month_to_ym(&month).ok_or_else(|| {
             McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
@@ -756,7 +823,7 @@ impl ActualServer {
         let v = api
             .rollover_budget(&month, &from_month)
             .await
-            .map_err(McpError::internal)?;
+            .map_err(budget_api_error)?;
         json_result(&v)
     }
 }

@@ -8,7 +8,8 @@ fn check_response<T>(resp: ApiResponse<T>, context: &str) -> anyhow::Result<T> {
     if resp.status != "ok" {
         bail!("{context}: server returned status '{}'", resp.status);
     }
-    resp.data.ok_or_else(|| anyhow::anyhow!("{context}: response data was null"))
+    resp.data
+        .ok_or_else(|| anyhow::anyhow!("{context}: response data was null"))
 }
 
 pub struct ActualClient {
@@ -128,7 +129,10 @@ impl ActualClient {
     }
 }
 
-pub fn find_budget_file<'a>(files: &'a [UserFile], budget_id: Option<&str>) -> Option<&'a UserFile> {
+pub fn find_budget_file<'a>(
+    files: &'a [UserFile],
+    budget_id: Option<&str>,
+) -> Option<&'a UserFile> {
     if let Some(id) = budget_id {
         files.iter().find(|f| f.file_id == id || f.name == id)
     } else {

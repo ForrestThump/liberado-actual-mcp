@@ -51,7 +51,12 @@ Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Bu
 
 Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
 
-Envelope amounts are integer cents. Examples:
+Envelope amounts are integer cents. **Income categories store their target as a
+negative value on the backend** (so `balance = budgeted + actual` holds with
+Actual's sign convention). Pass a *positive* `amount_cents` to these tools; a
+later readback via `get_budget_month` shows the negative target. Backend
+rejections (e.g. unknown category, invalid month) are returned as MCP
+invalid-params errors. Examples:
 
 ```json
 { "month": "2026-09", "category": "Groceries", "amount_cents": 50000 }
