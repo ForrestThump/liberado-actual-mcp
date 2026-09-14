@@ -24,6 +24,7 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `transactions_by_category` | Newest transactions whose category name matches a regex |
 | `budget_api_uncategorized` | Same as uncategorized_transactions, live from Liberado Budget REST |
 | `budget_api_transactions_by_category` | Category-regex transactions from Liberado Budget REST |
+| `get_summary` | Coaching snapshot from Liberado Budget REST: on-budget cash, credit, loans, `next_target`, cashflow (`month`, `extra_cents`, `strategy`) |
 | `list_loans` | Registered loans (balances, APR bps, min payments) from Liberado Budget REST |
 | `loan_projection` | Avalanche/snowball payoff projection (`strategy`, `extra_cents`) |
 | `balance_history` | Month-by-month running account balance |
@@ -33,7 +34,7 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 
 ### Write tools
 
-Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly.
+Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly. Live API reads (`get_summary`, `list_loans`, `loan_projection`, `budget_api_*`) use the same URL so coaching and debt views hit live truth, not a Syncthing mirror.
 
 | Tool | Description |
 |---|---|
@@ -81,10 +82,25 @@ invalid-params errors. Examples:
 { "month": "2026-10", "from_month": "2026-09" }
 ```
 
-Debt and import tools also go through REST (`list_loans` / `loan_projection` are
-reads of Liberado-only tables, not `ACTUAL_DB_PATH`). Money is integer cents.
+Debt, coaching, and import tools also go through REST (`get_summary`,
+`list_loans`, and `loan_projection` are live API reads, not `ACTUAL_DB_PATH`).
+Money is integer cents.
+
+`get_summary` is `GET /api/v1/summary` — the coaching snapshot agents should
+use instead of curling accounts + loans + ranking rules. Optional `month`
+(`YYYY-MM`; omitted → server current month), `extra_cents` (extra monthly
+payment; default 0), and `strategy` (`avalanche` default, or `snowball`).
+`on_budget_cash_cents` is open on-budget checking + savings. Credit cards stay
+accounts (ledger-signed) and are **not** in `next_target` unless registered as
+loans. Do not treat `net_worth` as cash.
+
+```json
+{ "month": "2026-09", "extra_cents": 10000, "strategy": "avalanche" }
+```
+
 `loan_projection` takes `strategy` (`avalanche` default, or `snowball`) and
-optional `extra_cents` (extra monthly payment; default 0).
+optional `extra_cents` (extra monthly payment; default 0). Full payoff schedule
+stays there; `get_summary` only returns the first extra-cash target.
 
 `import_csv` posts raw CSV — the REST API is `POST /api/v1/import/csv?account_id=&format=`
 with a `text/csv` body, which is awkward as a JSON file upload, so the MCP
@@ -229,7 +245,7 @@ Or for a running HTTP server:
 | `ACTUAL_SERVER_URL` | Server mode | URL of your Actual Budget server |
 | `ACTUAL_PASSWORD` | Server mode | Server password |
 | `ACTUAL_BUDGET_ID` | Server mode | Budget sync ID (uses first if omitted) |
-| `LIBERADO_BUDGET_API_URL` | Write tools | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
+| `LIBERADO_BUDGET_API_URL` | Write tools and live API reads | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
 | `BIND_ADDR` | No | Enables HTTP transport on this address; binary defaults to STDIO when unset (Docker image sets `0.0.0.0:8000`) |
 
 ---

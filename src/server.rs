@@ -228,7 +228,7 @@ impl ActualServer {
     fn budget_writes(&self) -> McpResult<&BudgetApi> {
         self.state.budget_api.as_ref().ok_or_else(|| {
             McpError::invalid_params(
-                "Write tools require LIBERADO_BUDGET_API_URL (Liberado Budget REST, not SQLite)",
+                "This tool requires LIBERADO_BUDGET_API_URL (Liberado Budget REST, not SQLite)",
             )
         })
     }
@@ -825,6 +825,44 @@ impl ActualServer {
         let api = self.budget_writes()?;
         let v = api
             .rollover_budget(&month, &from_month)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Coaching snapshot from Liberado Budget REST (requires LIBERADO_BUDGET_API_URL). \
+            Live on-budget cash, credit accounts, registered loans, optional next_target, \
+            and one-month cashflow — not the ACTUAL_DB_PATH Syncthing mirror. \
+            month is optional YYYY-MM (server default: current month). \
+            extra_cents is optional extra monthly payment in integer cents (default 0). \
+            strategy is avalanche (highest APR first, default) or snowball (smallest balance first). \
+            Credit cards are not in next_target unless registered as loans. \
+            Do not use net_worth as cash (it includes credit and loan ledgers). \
+            Full payoff schedule remains loan_projection."
+    )]
+    async fn get_summary(
+        &self,
+        month: Option<String>,
+        extra_cents: Option<i64>,
+        strategy: Option<String>,
+    ) -> McpResult<String> {
+        let month = month.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+        if let Some(m) = month.as_deref() {
+            month_to_ym(m).ok_or_else(|| {
+                McpError::invalid_params(format!("Invalid month '{m}'; expected YYYY-MM"))
+            })?;
+        }
+        let api = self.budget_writes()?;
+        let v = api
+            .get_summary(month.as_deref(), extra_cents, strategy.as_deref())
             .await
             .map_err(budget_api_error)?;
         json_result(&v)
