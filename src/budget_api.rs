@@ -1,7 +1,9 @@
-//! Liberado Budget REST write client.
+//! Liberado Budget REST client.
 //!
-//! Reads stay on SQLite. Writes go here so the MCP never opens the shared DB
-//! read-write. Base URL comes from `LIBERADO_BUDGET_API_URL`.
+//! SQLite reads stay on `ACTUAL_DB_PATH`. Writes and live API reads (loans,
+//! coaching summary, uncategorized listings) go here so they hit the running
+//! Liberado Budget server rather than a Syncthing mirror. Base URL comes from
+//! `LIBERADO_BUDGET_API_URL`.
 
 use serde_json::{json, Value};
 
@@ -389,6 +391,32 @@ impl BudgetApi {
             "/api/v1/loans/projection?strategy={strategy}&extra_cents={extra}"
         ))
         .await
+    }
+
+    /// Coaching snapshot: on-budget cash, credit, registered loans, optional
+    /// `next_target`, and one-month cashflow.
+    ///
+    /// Query params match `GET /api/v1/summary`: optional `month` (YYYY-MM;
+    /// omitted → server current month), `extra_cents` (default 0), `strategy`
+    /// (`avalanche` default, or `snowball`). Live REST, not `ACTUAL_DB_PATH`.
+    pub async fn get_summary(
+        &self,
+        month: Option<&str>,
+        extra_cents: Option<i64>,
+        strategy: Option<&str>,
+    ) -> Result<Value, String> {
+        let strategy = parse_loan_strategy(strategy)?;
+        let extra = extra_cents.unwrap_or(0);
+        if extra < 0 {
+            return Err("extra_cents must be >= 0".into());
+        }
+        let mut qs = Vec::new();
+        if let Some(m) = month.map(str::trim).filter(|s| !s.is_empty()) {
+            qs.push(format!("month={}", encode_query(m)));
+        }
+        qs.push(format!("extra_cents={extra}"));
+        qs.push(format!("strategy={strategy}"));
+        self.get(&format!("/api/v1/summary?{}", qs.join("&"))).await
     }
 
     /// Import a statement via Liberado Budget REST.
@@ -1106,6 +1134,87 @@ mod tests {
         let api = BudgetApi::new("http://127.0.0.1:1");
         let err = api.loan_projection(Some("foo"), Some(0)).await.unwrap_err();
         assert!(err.contains("avalanche|snowball"));
+    }
+
+    #[tokio::test]
+    async fn get_summary_gets_month_extra_and_strategy() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/summary?month=2026-07&extra_cents=10000&strategy=avalanche".into(),
+            200,
+            json!({
+                "month": "2026-07",
+                "on_budget_cash_cents": 150000,
+                "credit_balance_cents": -42000,
+                "credit_accounts": [{"id": "a-card", "name": "Card", "balance_cents": -42000}],
+                "unregistered_loan_accounts": [],
+                "loans": [{
+                    "id": "l-car",
+                    "account_id": "a-car",
+                    "name": "Car",
+                    "apr_bps": 699,
+                    "min_payment_cents": 35000,
+                    "balance_cents": 1250000
+                }],
+                "next_target": {
+                    "name": "Car",
+                    "account_id": "a-car",
+                    "apr_bps": 699,
+                    "extra_cents": 10000,
+                    "strategy": "avalanche"
+                },
+                "cashflow": {
+                    "month": "2026-07",
+                    "income_cents": 300000,
+                    "expenses_cents": -9000,
+                    "net_cents": 291000
+                }
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .get_summary(Some("2026-07"), Some(10000), Some("avalanche"))
+            .await
+            .unwrap();
+        assert_eq!(v["on_budget_cash_cents"], 150000);
+        assert_eq!(v["credit_accounts"][0]["name"], "Card");
+        assert_eq!(v["next_target"]["extra_cents"], 10000);
+        assert_eq!(v["cashflow"]["net_cents"], 291000);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_summary_omits_month_and_defaults_extra_strategy() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/summary?extra_cents=0&strategy=avalanche".into(),
+            200,
+            json!({
+                "on_budget_cash_cents": 0,
+                "next_target": null,
+                "loans": []
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.get_summary(None, None, None).await.unwrap();
+        assert_eq!(v["on_budget_cash_cents"], 0);
+        assert!(v["next_target"].is_null());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_summary_rejects_bad_strategy_and_negative_extra() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let err = api
+            .get_summary(None, Some(0), Some("minimums"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("avalanche|snowball"));
+        let err = api
+            .get_summary(Some("2026-07"), Some(-1), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains(">= 0"));
     }
 
     #[tokio::test]
