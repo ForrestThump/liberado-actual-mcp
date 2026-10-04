@@ -238,13 +238,31 @@ impl ActualServer {
 
 #[turbomcp::server(name = "actual-budget-mcp", version = "0.1.0")]
 impl ActualServer {
-    #[tool("List all accounts with their current balances")]
+    #[tool(
+        "List all accounts with their current balances from ACTUAL_DB_PATH. \
+            That file is often a lagging Syncthing mirror and can still show accounts \
+            the live server has removed. For live balances use list_live_accounts."
+    )]
     async fn list_accounts(&self) -> McpResult<String> {
         json_result(&self.query(db::list_accounts).await?)
     }
 
     #[tool(
-        "Get transactions for an account. account_id is optional (omit for all accounts). \
+        "List accounts and balances from the Liberado Budget REST API \
+            (requires LIBERADO_BUDGET_API_URL). Returns live ledger balances, \
+            not the ACTUAL_DB_PATH mirror."
+    )]
+    async fn list_live_accounts(&self) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api.list_live_accounts().await.map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Get transactions for an account from ACTUAL_DB_PATH. The mirror honors \
+            start_date and end_date but can lag the live server. For live rows whose \
+            dates are applied by the REST API, use get_live_transactions. \
+            account_id is optional (omit for all accounts). \
             start_date and end_date are optional ISO dates (YYYY-MM-DD). \
             limit caps the number returned (default 500, max 2000). \
             min_amount_cents and max_amount_cents filter by amount in cents \
@@ -306,6 +324,49 @@ impl ActualServer {
         )
     }
 
+    #[tool(
+        "Get transactions from the Liberado Budget REST API \
+            (requires LIBERADO_BUDGET_API_URL). start_date and end_date are \
+            inclusive ISO dates (YYYY-MM-DD) and are sent to the server, which \
+            applies them in SQL. Does not read ACTUAL_DB_PATH and does not \
+            download an unfiltered page to filter locally. \
+            account is id or name (omit for all accounts). \
+            category is id or name. payee and notes are partial, case-insensitive. \
+            limit defaults to 500 (max 2000). \
+            min_amount_cents and max_amount_cents are inclusive integer cents."
+    )]
+    // Same filter set as get_transactions; the REST call applies each one.
+    #[allow(clippy::too_many_arguments)]
+    async fn get_live_transactions(
+        &self,
+        account: Option<String>,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<i64>,
+        min_amount_cents: Option<i64>,
+        max_amount_cents: Option<i64>,
+        category: Option<String>,
+        payee: Option<String>,
+        notes: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .get_live_transactions(&crate::budget_api::LiveTransactionsQuery {
+                account: account.as_deref(),
+                start_date: start_date.as_deref(),
+                end_date: end_date.as_deref(),
+                limit,
+                min_amount_cents,
+                max_amount_cents,
+                category: category.as_deref(),
+                payee: payee.as_deref(),
+                notes: notes.as_deref(),
+            })
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
     #[tool("List all category groups and their categories")]
     async fn list_categories(&self) -> McpResult<String> {
         json_result(&self.query(db::list_categories).await?)
@@ -317,8 +378,11 @@ impl ActualServer {
     }
 
     #[tool(
-        "Get the budget and actual spending for each category in a month. \
-            month format: YYYY-MM (e.g. 2024-03)"
+        "Get the budget and actual spending for each category in a month from \
+            ACTUAL_DB_PATH. month format: YYYY-MM (e.g. 2024-03). \
+            The mirror folds zero_budgets and reflect_budgets into one budgeted \
+            amount, so rollover carry is not separate from this month's allocation, \
+            and the file can lag the live server. Use get_live_budget_month for the split."
     )]
     async fn get_budget_month(&self, month: String) -> McpResult<String> {
         let (start, end) = month_bounds(&month).ok_or_else(|| {
@@ -329,6 +393,31 @@ impl ActualServer {
                 .query(move |p| db::get_budget_month(p, &month, start, end))
                 .await?,
         )
+    }
+
+    #[tool(
+        "Live envelope month from Liberado Budget REST (requires LIBERADO_BUDGET_API_URL). \
+            month is YYYY-MM. Per category, allocation_cents is this month's zero-budget \
+            assignment, carry_cents is reflect/rollover from prior months, spent_cents is \
+            activity, and budget_cents is allocation plus carry. \
+            Does not read ACTUAL_DB_PATH. Does not treat the combined budgeted_cents \
+            figure as the allocation. If the API only returns that sum, this tool errors \
+            and names the ForrestThump/liberado-budget gap instead of guessing. \
+            set_budget_allocations writes the allocation only and leaves carry rows alone."
+    )]
+    async fn get_live_budget_month(&self, month: String) -> McpResult<String> {
+        month_to_ym(&month).ok_or_else(|| {
+            McpError::invalid_params(format!("Invalid month '{month}'; expected YYYY-MM"))
+        })?;
+        let api = self.budget_writes()?;
+        let v = api.get_live_budget_month(&month).await.map_err(|e| {
+            if e.contains("ForrestThump/liberado-budget") {
+                McpError::internal(e)
+            } else {
+                budget_api_error(e)
+            }
+        })?;
+        json_result(&v)
     }
 
     #[tool(
@@ -744,7 +833,9 @@ impl ActualServer {
     #[tool(
         "Set one category's monthly envelope allocation via Liberado Budget REST. \
             category is id or name. month is YYYY-MM (e.g. 2026-09). \
-            amount_cents is integer cents (100 = $1.00). \
+            amount_cents is integer cents (100 = $1.00) and is the zero-budget \
+            allocation only. Reflect/rollover carry is left unchanged; do not fold \
+            leftover carry into amount_cents. \
             Income categories store their target as a negative value on the backend; \
             pass a positive amount_cents and readback via get_budget_month will be negative."
     )]
@@ -769,6 +860,8 @@ impl ActualServer {
         "Set many category allocations for a month in one call via Liberado Budget REST. \
             month is YYYY-MM. allocations is a JSON array of \
             {category (id or name) or category_id, amount_cents}. \
+            amount_cents is the zero-budget allocation only. Reflect/rollover carry \
+            is left unchanged; do not fold leftover carry into amount_cents. \
             Income categories store their target as a negative value on the backend; \
             pass positive amount_cents and readback via get_budget_month will be negative."
     )]
@@ -839,6 +932,8 @@ impl ActualServer {
             strategy is avalanche (highest APR first, default) or snowball (smallest balance first). \
             Credit cards are not in next_target unless registered as loans. \
             Do not use net_worth as cash (it includes credit and loan ledgers). \
+            Cashflow does not split envelope allocation from rollover carry; \
+            use get_live_budget_month for that. \
             Full payoff schedule remains loan_projection."
     )]
     async fn get_summary(
