@@ -1,9 +1,9 @@
 //! Liberado Budget REST client.
 //!
-//! SQLite reads stay on `ACTUAL_DB_PATH`. Writes and live API reads (loans,
-//! coaching summary, uncategorized listings) go here so they hit the running
-//! Liberado Budget server rather than a Syncthing mirror. Base URL comes from
-//! `LIBERADO_BUDGET_API_URL`.
+//! SQLite reads stay on `ACTUAL_DB_PATH`. Writes and live API reads (accounts,
+//! transactions, envelope months, loans, coaching summary, uncategorized
+//! listings) go here so they hit the running Liberado Budget server rather
+//! than a Syncthing mirror. Base URL comes from `LIBERADO_BUDGET_API_URL`.
 
 use serde_json::{json, Value};
 
@@ -376,6 +376,57 @@ impl BudgetApi {
         .await
     }
 
+    /// Live account list (`GET /api/v1/accounts`), including `balance_cents`.
+    ///
+    /// The running Liberado Budget server, not the `ACTUAL_DB_PATH` mirror.
+    pub async fn list_live_accounts(&self) -> Result<Value, String> {
+        self.get("/api/v1/accounts").await
+    }
+
+    /// Live transactions (`GET /api/v1/transactions`).
+    ///
+    /// `start_date` and `end_date` are query parameters. Liberado Budget applies
+    /// them in SQL (`t.date >= start AND t.date <= end`). This client does not
+    /// download an unfiltered page and filter it afterward.
+    pub async fn get_live_transactions(
+        &self,
+        query: &LiveTransactionsQuery<'_>,
+    ) -> Result<Value, String> {
+        let account_id = match query.account.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(account) => Some(self.resolve_account(account).await?),
+            None => None,
+        };
+        let category_id = match query.category.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(category) => Some(self.resolve_category(category).await?),
+            None => None,
+        };
+        let path = live_transactions_path(&ResolvedTransactionsQuery {
+            account_id: account_id.as_deref(),
+            category_id: category_id.as_deref(),
+            start_date: query.start_date,
+            end_date: query.end_date,
+            limit: query.limit.unwrap_or(500),
+            min_amount_cents: query.min_amount_cents,
+            max_amount_cents: query.max_amount_cents,
+            payee: query.payee,
+            notes: query.notes,
+        })?;
+        self.get(&path).await
+    }
+
+    /// Live envelope month (`GET /api/v1/budgets/{month}`).
+    ///
+    /// Returns allocation (zero budget) and carry (reflect / rollover) as
+    /// separate amounts. Refuses a payload that only has the combined
+    /// `budgeted_cents` sum, so leftover carry is not reported as this month's
+    /// allocation.
+    pub async fn get_live_budget_month(&self, month: &str) -> Result<Value, String> {
+        let doc = self
+            .get(&format!("/api/v1/budgets/{}", encode_query(month)))
+            .await?;
+        project_live_budget_month(&doc)
+    }
+
     pub async fn list_loans(&self) -> Result<Value, String> {
         self.get("/api/v1/loans").await
     }
@@ -691,6 +742,291 @@ pub fn parse_inbox_filename(name: &str) -> Result<String, String> {
         return Err("inbox_file must be a basename in the Liberado Budget import inbox".into());
     }
     Ok(name.to_string())
+}
+
+/// Filters for `GET /api/v1/transactions`. `account` and `category` are id or name.
+pub struct LiveTransactionsQuery<'a> {
+    pub account: Option<&'a str>,
+    pub start_date: Option<&'a str>,
+    pub end_date: Option<&'a str>,
+    pub limit: Option<i64>,
+    pub min_amount_cents: Option<i64>,
+    pub max_amount_cents: Option<i64>,
+    pub category: Option<&'a str>,
+    pub payee: Option<&'a str>,
+    pub notes: Option<&'a str>,
+}
+
+struct ResolvedTransactionsQuery<'a> {
+    account_id: Option<&'a str>,
+    category_id: Option<&'a str>,
+    start_date: Option<&'a str>,
+    end_date: Option<&'a str>,
+    limit: i64,
+    min_amount_cents: Option<i64>,
+    max_amount_cents: Option<i64>,
+    payee: Option<&'a str>,
+    notes: Option<&'a str>,
+}
+
+/// Path for a live transaction query. Dates are included whenever the caller
+/// set them; they are not applied by dropping rows from a wider response.
+fn live_transactions_path(q: &ResolvedTransactionsQuery<'_>) -> Result<String, String> {
+    validate_iso_date("start_date", q.start_date)?;
+    validate_iso_date("end_date", q.end_date)?;
+    let limit = q.limit.clamp(1, 2000);
+    let mut parts = Vec::new();
+    push_query(&mut parts, "account_id", q.account_id);
+    push_query(&mut parts, "start_date", q.start_date);
+    push_query(&mut parts, "end_date", q.end_date);
+    push_query(&mut parts, "category_id", q.category_id);
+    push_query(&mut parts, "payee", q.payee);
+    push_query(&mut parts, "notes", q.notes);
+    if let Some(n) = q.min_amount_cents {
+        parts.push(format!("min_amount_cents={n}"));
+    }
+    if let Some(n) = q.max_amount_cents {
+        parts.push(format!("max_amount_cents={n}"));
+    }
+    parts.push(format!("limit={limit}"));
+    Ok(format!("/api/v1/transactions?{}", parts.join("&")))
+}
+
+fn validate_iso_date(name: &str, value: Option<&str>) -> Result<(), String> {
+    let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if crate::models::date_str_to_int(value).is_none() {
+        return Err(format!("Invalid {name} '{value}'; expected YYYY-MM-DD"));
+    }
+    Ok(())
+}
+
+fn push_query(parts: &mut Vec<String>, key: &str, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    parts.push(format!("{key}={}", encode_query(value)));
+}
+
+/// `GET /api/v1/budgets/{month}` currently stores one number per category:
+/// `budgeted_cents` (and `envelopes[].allocated_cents`) is
+/// `SUM(zero_budgets) + SUM(reflect_budgets)`. October 2026 Tithing was a
+/// $570.28 allocation plus $282.64 of September carry, and that endpoint
+/// reported $852.92. Writing that sum back through `set_budget_allocations`
+/// updates only the zero-budget row and leaves the reflect row, so the carry
+/// is double-counted.
+const BUDGET_MONTH_SPLIT_GAP: &str = "\
+GET /api/v1/budgets/{month} does not split this month's allocation from rollover carry. \
+budgeted_cents and envelopes.allocated_cents are the sum of zero_budgets (this month's allocation) \
+and reflect_budgets (carry). This gap belongs in ForrestThump/liberado-budget: return \
+allocation_cents and carry_cents on each category, or zero_budgets and reflect_budgets arrays. \
+Do not pass that sum to set_budget_allocations; the write updates only the zero-budget row and \
+leaves the reflect row in place, which double-counts carry.";
+
+struct LiveCategoryParts {
+    id: String,
+    name: String,
+    group: String,
+    is_income: bool,
+    allocation: i64,
+    carry: i64,
+    spent: i64,
+}
+
+/// Project a budget-month JSON document into allocation, carry, spent, and
+/// total budget. `budgeted_cents` is never copied into `allocation_cents`.
+pub fn project_live_budget_month(doc: &Value) -> Result<Value, String> {
+    let month = doc
+        .get("month")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let categories = doc.get("categories").and_then(|c| c.as_array());
+    if let Some(cats) = categories {
+        let split: Vec<bool> = cats.iter().map(category_has_split_fields).collect();
+        if split.iter().any(|present| *present) {
+            if split.iter().any(|present| !*present) {
+                return Err(
+                    "budget month categories are missing allocation_cents or carry_cents; refusing to treat budgeted_cents as the allocation"
+                        .into(),
+                );
+            }
+            return Ok(render_live_month(&month, parts_from_fields(cats)?));
+        }
+    }
+    if doc.get("zero_budgets").is_some() || doc.get("reflect_budgets").is_some() {
+        let zero = require_budget_array(doc, "zero_budgets")?;
+        let reflect = require_budget_array(doc, "reflect_budgets")?;
+        return Ok(render_live_month(
+            &month,
+            parts_from_arrays(categories, zero, reflect)?,
+        ));
+    }
+    Err(BUDGET_MONTH_SPLIT_GAP.into())
+}
+
+fn category_has_split_fields(category: &Value) -> bool {
+    json_i64(category, "allocation_cents").is_some() && json_i64(category, "carry_cents").is_some()
+}
+
+fn parts_from_fields(cats: &[Value]) -> Result<Vec<LiveCategoryParts>, String> {
+    let mut out = Vec::with_capacity(cats.len());
+    for category in cats {
+        let allocation = json_i64(category, "allocation_cents")
+            .ok_or_else(|| "category missing allocation_cents".to_string())?;
+        let carry = json_i64(category, "carry_cents")
+            .ok_or_else(|| "category missing carry_cents".to_string())?;
+        out.push(parts_from_category(category, allocation, carry));
+    }
+    Ok(out)
+}
+
+fn parts_from_category(category: &Value, allocation: i64, carry: i64) -> LiveCategoryParts {
+    LiveCategoryParts {
+        id: json_str(category, "category_id").unwrap_or("").to_string(),
+        name: json_str(category, "category_name")
+            .unwrap_or("")
+            .to_string(),
+        group: json_str(category, "group_name").unwrap_or("").to_string(),
+        is_income: category
+            .get("is_income")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        allocation,
+        carry,
+        spent: json_i64(category, "spent_cents").unwrap_or(0),
+    }
+}
+
+fn parts_from_arrays(
+    categories: Option<&Vec<Value>>,
+    zero: &[Value],
+    reflect: &[Value],
+) -> Result<Vec<LiveCategoryParts>, String> {
+    let mut rows = Vec::new();
+    let mut index = std::collections::HashMap::<String, usize>::new();
+    if let Some(cats) = categories {
+        for category in cats {
+            let id = json_str(category, "category_id").unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            index.insert(id, rows.len());
+            rows.push(parts_from_category(category, 0, 0));
+        }
+    }
+    apply_budget_rows(&mut rows, &mut index, zero, true)?;
+    apply_budget_rows(&mut rows, &mut index, reflect, false)?;
+    Ok(rows)
+}
+
+fn apply_budget_rows(
+    rows: &mut Vec<LiveCategoryParts>,
+    index: &mut std::collections::HashMap<String, usize>,
+    src: &[Value],
+    allocation: bool,
+) -> Result<(), String> {
+    for (i, row) in src.iter().enumerate() {
+        let amount = json_i64(row, "amount_cents")
+            .or_else(|| json_i64(row, "amount"))
+            .ok_or_else(|| format!("budget row {i} missing amount_cents"))?;
+        let key = json_str(row, "category_id")
+            .or_else(|| json_str(row, "category"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("budget row {i} missing category_id"))?;
+        let idx = find_or_insert_category(rows, index, key);
+        if allocation {
+            rows[idx].allocation += amount;
+        } else {
+            rows[idx].carry += amount;
+        }
+    }
+    Ok(())
+}
+
+fn find_or_insert_category(
+    rows: &mut Vec<LiveCategoryParts>,
+    index: &mut std::collections::HashMap<String, usize>,
+    key: &str,
+) -> usize {
+    if let Some(&idx) = index.get(key) {
+        return idx;
+    }
+    if let Some(idx) = rows
+        .iter()
+        .position(|row| row.name.eq_ignore_ascii_case(key))
+    {
+        index.insert(key.to_string(), idx);
+        return idx;
+    }
+    index.insert(key.to_string(), rows.len());
+    rows.push(LiveCategoryParts {
+        id: key.to_string(),
+        name: key.to_string(),
+        group: String::new(),
+        is_income: false,
+        allocation: 0,
+        carry: 0,
+        spent: 0,
+    });
+    rows.len() - 1
+}
+
+fn render_live_month(month: &str, cats: Vec<LiveCategoryParts>) -> Value {
+    let total_allocation: i64 = cats.iter().map(|c| c.allocation).sum();
+    let total_carry: i64 = cats.iter().map(|c| c.carry).sum();
+    let total_spent: i64 = cats.iter().map(|c| c.spent).sum();
+    let total_budget = total_allocation + total_carry;
+    let categories: Vec<Value> = cats
+        .iter()
+        .map(|c| {
+            let budget = c.allocation + c.carry;
+            json!({
+                "category_id": c.id,
+                "category_name": c.name,
+                "group_name": c.group,
+                "is_income": c.is_income,
+                "allocation_cents": c.allocation,
+                "allocation_display": crate::models::format_amount(c.allocation),
+                "carry_cents": c.carry,
+                "carry_display": crate::models::format_amount(c.carry),
+                "spent_cents": c.spent,
+                "spent_display": crate::models::format_amount(c.spent),
+                "budget_cents": budget,
+                "budget_display": crate::models::format_amount(budget),
+            })
+        })
+        .collect();
+    json!({
+        "month": month,
+        "categories": categories,
+        "total_allocation_cents": total_allocation,
+        "total_allocation_display": crate::models::format_amount(total_allocation),
+        "total_carry_cents": total_carry,
+        "total_carry_display": crate::models::format_amount(total_carry),
+        "total_spent_cents": total_spent,
+        "total_spent_display": crate::models::format_amount(total_spent),
+        "total_budget_cents": total_budget,
+        "total_budget_display": crate::models::format_amount(total_budget),
+    })
+}
+
+fn require_budget_array<'a>(doc: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
+    match doc.get(key) {
+        Some(Value::Array(rows)) => Ok(rows),
+        Some(_) => Err(format!("{key} must be an array")),
+        None => Err(format!("{key} is missing; {BUDGET_MONTH_SPLIT_GAP}")),
+    }
+}
+
+fn json_i64(v: &Value, key: &str) -> Option<i64> {
+    v.get(key).and_then(|x| x.as_i64())
+}
+
+fn json_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
 }
 
 fn encode_query(s: &str) -> String {
@@ -1349,6 +1685,273 @@ mod tests {
         let api = BudgetApi::new(base);
         let v = api.pin_balance("Checking", 105000).await.unwrap();
         assert_eq!(v["balance_cents"], 105000);
+        h.join().unwrap();
+    }
+
+    /// October 2026 Tithing: $570.28 assigned this month plus $282.64 of
+    /// September carry. The combined $852.92 must not come back as the allocation.
+    fn tithing_split_category() -> Value {
+        json!({
+            "category_id": "c-tithe",
+            "category_name": "Tithing",
+            "group_name": "Giving",
+            "is_income": false,
+            "budgeted_cents": 85292,
+            "budgeted_display": "$852.92",
+            "spent_cents": 0,
+            "spent_display": "$0.00",
+            "balance_cents": 85292,
+            "balance_display": "$852.92",
+            "allocation_cents": 57028,
+            "carry_cents": 28264
+        })
+    }
+
+    fn assert_tithing_split(cat: &Value) {
+        assert_eq!(cat["category_name"], "Tithing");
+        assert_eq!(cat["allocation_cents"], 57028);
+        assert_eq!(cat["carry_cents"], 28264);
+        assert_eq!(cat["spent_cents"], 0);
+        assert_eq!(cat["budget_cents"], 85292);
+        assert_ne!(cat["allocation_cents"], cat["budget_cents"]);
+        assert_ne!(cat["allocation_cents"], cat["carry_cents"]);
+    }
+
+    #[test]
+    fn live_budget_month_keeps_allocation_and_carry_separate() {
+        let doc = json!({
+            "month": "2026-10",
+            "categories": [tithing_split_category()],
+            "envelopes": [{
+                "category_id": "c-tithe",
+                "name": "Tithing",
+                "allocated_cents": 85292
+            }],
+            "total_budgeted_cents": 85292
+        });
+        let v = project_live_budget_month(&doc).unwrap();
+        assert_eq!(v["month"], "2026-10");
+        assert_tithing_split(&v["categories"][0]);
+        assert_eq!(v["total_allocation_cents"], 57028);
+        assert_eq!(v["total_carry_cents"], 28264);
+        assert_eq!(v["total_budget_cents"], 85292);
+        assert_ne!(v["total_allocation_cents"], v["total_budget_cents"]);
+    }
+
+    #[test]
+    fn live_budget_month_reads_zero_and_reflect_arrays() {
+        let doc = json!({
+            "month": "2026-10",
+            "categories": [{
+                "category_id": "c-tithe",
+                "category_name": "Tithing",
+                "group_name": "Giving",
+                "is_income": false,
+                "budgeted_cents": 85292,
+                "spent_cents": 0
+            }],
+            "zero_budgets": [{"category_id": "c-tithe", "amount_cents": 57028}],
+            "reflect_budgets": [{"category_id": "c-tithe", "amount_cents": 28264}]
+        });
+        let v = project_live_budget_month(&doc).unwrap();
+        assert_tithing_split(&v["categories"][0]);
+    }
+
+    #[test]
+    fn live_budget_month_refuses_combined_budgeted_cents() {
+        // Shape actually returned by liberado-budget today: one summed number.
+        let doc = json!({
+            "month": "2026-10",
+            "categories": [{
+                "category_id": "c-tithe",
+                "category_name": "Tithing",
+                "group_name": "Giving",
+                "is_income": false,
+                "budgeted_cents": 85292,
+                "spent_cents": 0,
+                "balance_cents": 85292
+            }],
+            "envelopes": [{
+                "category_id": "c-tithe",
+                "allocated_cents": 85292,
+                "activity_cents": 0,
+                "remaining_cents": 85292
+            }],
+            "total_budgeted_cents": 85292
+        });
+        let err = project_live_budget_month(&doc).unwrap_err();
+        assert!(err.contains("reflect_budgets"), "{err}");
+        assert!(err.contains("ForrestThump/liberado-budget"), "{err}");
+        assert!(err.contains("set_budget_allocations"), "{err}");
+        assert!(!err.contains("\"allocation_cents\": 85292"), "{err}");
+    }
+
+    #[test]
+    fn live_transactions_path_sends_start_and_end() {
+        let path = live_transactions_path(&ResolvedTransactionsQuery {
+            account_id: None,
+            category_id: None,
+            start_date: Some("2026-10-01"),
+            end_date: Some("2026-10-31"),
+            limit: 500,
+            min_amount_cents: None,
+            max_amount_cents: None,
+            payee: None,
+            notes: None,
+        })
+        .unwrap();
+        assert_eq!(
+            path,
+            "/api/v1/transactions?start_date=2026-10-01&end_date=2026-10-31&limit=500"
+        );
+        let err = live_transactions_path(&ResolvedTransactionsQuery {
+            account_id: None,
+            category_id: None,
+            start_date: Some("October"),
+            end_date: Some("2026-10-31"),
+            limit: 500,
+            min_amount_cents: None,
+            max_amount_cents: None,
+            payee: None,
+            notes: None,
+        })
+        .unwrap_err();
+        assert!(err.contains("start_date"));
+    }
+
+    #[tokio::test]
+    async fn list_live_accounts_returns_rest_balances() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/accounts".into(),
+            200,
+            json!({
+                "accounts": [
+                    {
+                        "id": "a-chk",
+                        "name": "Checking",
+                        "type": "checking",
+                        "offbudget": false,
+                        "closed": false,
+                        "balance_cents": 125000,
+                        "balance_display": "$1250.00"
+                    }
+                ]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.list_live_accounts().await.unwrap();
+        assert_eq!(v["accounts"][0]["balance_cents"], 125000);
+        assert_eq!(v["accounts"][0]["name"], "Checking");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_live_transactions_sends_start_and_end_dates() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/transactions?start_date=2026-10-01&end_date=2026-10-31&limit=50".into(),
+            200,
+            json!({
+                "transactions": [{
+                    "id": "t1",
+                    "date": "2026-10-04",
+                    "amount_cents": -57028
+                }]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .get_live_transactions(&LiveTransactionsQuery {
+                account: None,
+                start_date: Some("2026-10-01"),
+                end_date: Some("2026-10-31"),
+                limit: Some(50),
+                min_amount_cents: None,
+                max_amount_cents: None,
+                category: None,
+                payee: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(v["transactions"][0]["date"], "2026-10-04");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_live_transactions_resolves_account_and_keeps_dates() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+            ),
+            (
+                "/api/v1/transactions?account_id=a-chk&start_date=2026-10-01&end_date=2026-10-31&limit=500"
+                    .into(),
+                200,
+                json!({"transactions": []}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .get_live_transactions(&LiveTransactionsQuery {
+                account: Some("Checking"),
+                start_date: Some("2026-10-01"),
+                end_date: Some("2026-10-31"),
+                limit: None,
+                min_amount_cents: None,
+                max_amount_cents: None,
+                category: None,
+                payee: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert!(v["transactions"].as_array().unwrap().is_empty());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_live_budget_month_projects_split_from_rest() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/budgets/2026-10".into(),
+            200,
+            json!({
+                "month": "2026-10",
+                "categories": [tithing_split_category()],
+                "total_budgeted_cents": 85292
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.get_live_budget_month("2026-10").await.unwrap();
+        assert_tithing_split(&v["categories"][0]);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_live_budget_month_errors_when_api_sums_carry_into_budgeted() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/budgets/2026-10".into(),
+            200,
+            json!({
+                "month": "2026-10",
+                "categories": [{
+                    "category_id": "c-tithe",
+                    "category_name": "Tithing",
+                    "budgeted_cents": 85292,
+                    "spent_cents": 0
+                }],
+                "envelopes": [{"allocated_cents": 85292}]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let err = api.get_live_budget_month("2026-10").await.unwrap_err();
+        assert!(err.contains("ForrestThump/liberado-budget"), "{err}");
+        assert!(!err.contains("\"allocation_cents\": 85292"), "{err}");
         h.join().unwrap();
     }
 }

@@ -12,11 +12,14 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 
 | Tool | Description |
 |---|---|
-| `list_accounts` | All accounts with current balances |
-| `get_transactions` | Transaction history with optional filters (see below) |
+| `list_accounts` | All accounts with current balances from `ACTUAL_DB_PATH` (may lag) |
+| `list_live_accounts` | Live account balances from Liberado Budget REST |
+| `get_transactions` | Transaction history from `ACTUAL_DB_PATH` with optional filters (see below) |
+| `get_live_transactions` | Live transactions from Liberado Budget REST; `start_date` and `end_date` are applied by the API |
 | `list_categories` | Category groups and categories |
 | `list_payees` | All payees |
-| `get_budget_month` | Budgeted vs. actual spending by category for a month |
+| `get_budget_month` | Budgeted vs. actual spending by category for a month, from `ACTUAL_DB_PATH` (allocation and carry are combined) |
+| `get_live_budget_month` | Live month from Liberado Budget REST: allocation, carry, spent, and total budget kept separate |
 | `monthly_summary` | Income, expenses, net savings per month over a range |
 | `spending_by_category` | Expense totals grouped by category for a date range |
 | `spending_by_payee` | Expense totals grouped by payee for a date range |
@@ -34,7 +37,7 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 
 ### Write tools
 
-Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly. Live API reads (`get_summary`, `list_loans`, `loan_projection`, `budget_api_*`) use the same URL so coaching and debt views hit live truth, not a Syncthing mirror.
+Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly. Live API reads (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `get_summary`, `list_loans`, `loan_projection`, `budget_api_*`) use the same URL so they hit the running server, not a Syncthing mirror.
 
 | Tool | Description |
 |---|---|
@@ -56,6 +59,25 @@ Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Bu
 | `pin_balance` | Back-adjust starting balance so ledger equals `balance_cents` |
 
 Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
+
+### Live reads vs the SQLite mirror
+
+`list_accounts`, `get_transactions`, and `get_budget_month` read `ACTUAL_DB_PATH`. That file is often a lagging Syncthing mirror: it can omit writes the live server already has, and it can still list accounts the live server has removed. Use `list_live_accounts`, `get_live_transactions`, and `get_live_budget_month` when the answer has to match the server that `set_budget_allocations` writes to.
+
+`get_live_transactions` sends `start_date` and `end_date` on `GET /api/v1/transactions`. Liberado Budget applies those bounds in SQL (`t.date >= start AND t.date <= end`). This server does not download an unfiltered page and filter it locally.
+
+`get_live_budget_month` returns, per category:
+
+| Field | Meaning |
+|---|---|
+| `allocation_cents` | This month's envelope assignment (`zero_budgets` only) |
+| `carry_cents` | Rollover from prior months (`reflect_budgets` only) |
+| `spent_cents` | Activity in the month (expenses are negative) |
+| `budget_cents` | `allocation_cents + carry_cents` |
+
+`set_budget_allocations` and `set_budget_amount` write `amount_cents` to the zero-budget row only. Reflect/carry rows are left alone. Pass the allocation. Folding leftover carry into `amount_cents` leaves the reflect row in place and double-counts it.
+
+**Gap in ForrestThump/liberado-budget:** `GET /api/v1/budgets/{month}` does not return allocation and carry separately today. `categories[].budgeted_cents` and `envelopes[].allocated_cents` are `SUM(zero_budgets.amount) + SUM(reflect_budgets.amount)` (see `get_budget_month_sums_zero_and_reflect_allocations` in that repo's `src/domain/read.rs`). October 2026 Tithing was a $570.28 allocation plus $282.64 of September carry, and that endpoint reported $852.92. `get_summary` cashflow is one combined month figure and does not split them either. `get_live_budget_month` refuses that payload so the sum is not labeled as the allocation. It succeeds once the budget API adds `allocation_cents` and `carry_cents` on each category, or top-level `zero_budgets` and `reflect_budgets` arrays (`category_id` + `amount_cents`). Until then, do not copy `budgeted_cents` into `set_budget_allocations`.
 
 Envelope amounts are integer cents. **Income categories store their target as a
 negative value on the backend** (so `balance = budgeted + actual` holds with
@@ -83,8 +105,9 @@ invalid-params errors. Examples:
 ```
 
 Debt, coaching, and import tools also go through REST (`get_summary`,
-`list_loans`, and `loan_projection` are live API reads, not `ACTUAL_DB_PATH`).
-Money is integer cents.
+`list_loans`, and `loan_projection` are live API reads). Account balances,
+dated transactions, and the envelope month use `list_live_accounts`,
+`get_live_transactions`, and `get_live_budget_month`. Money is integer cents.
 
 `get_summary` is `GET /api/v1/summary` — the coaching snapshot agents should
 use instead of curling accounts + loans + ranking rules. Optional `month`
@@ -92,7 +115,8 @@ use instead of curling accounts + loans + ranking rules. Optional `month`
 payment; default 0), and `strategy` (`avalanche` default, or `snowball`).
 `on_budget_cash_cents` is open on-budget checking + savings. Credit cards stay
 accounts (ledger-signed) and are **not** in `next_target` unless registered as
-loans. Do not treat `net_worth` as cash.
+loans. Do not treat `net_worth` as cash. Cashflow is one month of income and
+expenses; envelope allocation versus rollover carry is `get_live_budget_month`.
 
 ```json
 { "month": "2026-09", "extra_cents": 10000, "strategy": "avalanche" }
@@ -245,7 +269,7 @@ Or for a running HTTP server:
 | `ACTUAL_SERVER_URL` | Server mode | URL of your Actual Budget server |
 | `ACTUAL_PASSWORD` | Server mode | Server password |
 | `ACTUAL_BUDGET_ID` | Server mode | Budget sync ID (uses first if omitted) |
-| `LIBERADO_BUDGET_API_URL` | Write tools and live API reads | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
+| `LIBERADO_BUDGET_API_URL` | Write tools and live API reads (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `get_summary`, `list_loans`, …) | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
 | `BIND_ADDR` | No | Enables HTTP transport on this address; binary defaults to STDIO when unset (Docker image sets `0.0.0.0:8000`) |
 
 ---
