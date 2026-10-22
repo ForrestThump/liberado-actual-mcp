@@ -1141,4 +1141,41 @@ impl ActualServer {
             .map_err(budget_api_error)?;
         json_result(&v)
     }
+
+    #[tool(
+        "Credit terms for one account from live REST (authoritative). \
+            GET /api/v1/accounts/{id}/credit-terms. \
+            account is id or name. \
+            Returns apr_bps and min_payment_cents when the account has terms."
+    )]
+    async fn get_credit_terms(&self, account: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .get_credit_terms(&account)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Write credit terms for one account via live REST (authoritative). \
+            This tool writes: PUT /api/v1/accounts/{id}/credit-terms. \
+            account is id or name. \
+            apr_bps is required, from 0 to 10000 (10000 = 100%). \
+            min_payment_cents is optional integer cents and must be >= 0. \
+            Omit min_payment_cents to store no minimum."
+    )]
+    async fn set_credit_terms(
+        &self,
+        account: String,
+        apr_bps: i64,
+        min_payment_cents: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .set_credit_terms(&account, apr_bps, min_payment_cents)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
 }

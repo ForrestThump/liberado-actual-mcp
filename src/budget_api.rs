@@ -636,6 +636,46 @@ impl BudgetApi {
         self.get(&path).await
     }
 
+    /// `GET /api/v1/accounts/{id}/credit-terms`. `account` is an id or name.
+    pub async fn get_credit_terms(&self, account: &str) -> Result<Value, String> {
+        let id = self.resolve_account(account).await?;
+        self.get(&format!(
+            "/api/v1/accounts/{}/credit-terms",
+            encode_query(&id)
+        ))
+        .await
+    }
+
+    /// `PUT /api/v1/accounts/{id}/credit-terms`.
+    ///
+    /// `apr_bps` must be 0..=10000. `min_payment_cents`, when set, must be >= 0.
+    /// Omitting the minimum stores no minimum (the field is left out of the body).
+    pub async fn set_credit_terms(
+        &self,
+        account: &str,
+        apr_bps: i64,
+        min_payment_cents: Option<i64>,
+    ) -> Result<Value, String> {
+        if !(0..=10_000).contains(&apr_bps) {
+            return Err("apr_bps must be between 0 and 10000".into());
+        }
+        if let Some(min) = min_payment_cents {
+            if min < 0 {
+                return Err("min_payment_cents must be >= 0".into());
+            }
+        }
+        let id = self.resolve_account(account).await?;
+        let mut body = json!({ "apr_bps": apr_bps });
+        if let Some(min) = min_payment_cents {
+            body["min_payment_cents"] = json!(min);
+        }
+        self.put(
+            &format!("/api/v1/accounts/{}/credit-terms", encode_query(&id)),
+            &body,
+        )
+        .await
+    }
+
     /// Spending for a date range from live REST.
     ///
     /// `group_by=category` uses `GET /api/v1/spending/by-category` (the server
@@ -1907,6 +1947,82 @@ fn spawn_api_key_mock(
         }
     });
     (format!("http://{addr}"), handle)
+}
+
+/// Like [`spawn_json_mock`], and returns each raw request so a test can check a body.
+#[cfg(test)]
+fn spawn_request_mock(
+    routes: Vec<(String, u16, String)>,
+) -> (
+    String,
+    thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<String>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for (expect_path, status, body) in routes {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let req = read_http_request(&mut stream);
+            let line = req.lines().next().unwrap_or("");
+            assert!(
+                line.contains(&expect_path),
+                "expected path {expect_path} in {line}"
+            );
+            let _ = tx.send(req);
+            let resp = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), handle, rx)
+}
+
+#[cfg(test)]
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .ok();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    while buf.len() < 8192 {
+        match stream.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if http_request_complete(&buf) {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(test)]
+fn http_request_complete(buf: &[u8]) -> bool {
+    let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = std::str::from_utf8(&buf[..split]).unwrap_or("");
+    let len = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    });
+    match len {
+        Some(len) => buf.len() >= split + 4 + len,
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -3246,5 +3362,113 @@ mod tests {
             months.contains("lookback_months must be between 1 and 36"),
             "{months}"
         );
+    }
+
+    fn card_accounts() -> String {
+        json!({"accounts": [{"id": "a-card", "name": "Card"}]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn get_credit_terms_resolves_account_name() {
+        let (base, h) = spawn_json_mock(vec![
+            ("/api/v1/accounts HTTP".into(), 200, card_accounts()),
+            (
+                "/api/v1/accounts/a-card/credit-terms".into(),
+                200,
+                json!({"account_id": "a-card", "apr_bps": 2499, "min_payment_cents": 3500})
+                    .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.get_credit_terms("Card").await.unwrap();
+        assert_eq!(v["account_id"], "a-card");
+        assert_eq!(v["apr_bps"], 2499);
+        assert_eq!(v["min_payment_cents"], 3500);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_credit_terms_puts_bounds_and_optional_min() {
+        let (base, h, rx) = spawn_request_mock(vec![
+            ("/api/v1/accounts HTTP".into(), 200, card_accounts()),
+            (
+                "PUT /api/v1/accounts/a-card/credit-terms".into(),
+                200,
+                json!({"account_id": "a-card", "apr_bps": 0, "min_payment_cents": 0}).to_string(),
+            ),
+            ("/api/v1/accounts HTTP".into(), 200, card_accounts()),
+            (
+                "PUT /api/v1/accounts/a-card/credit-terms".into(),
+                200,
+                json!({"account_id": "a-card", "apr_bps": 10000, "min_payment_cents": 5000})
+                    .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let zero = api.set_credit_terms("a-card", 0, Some(0)).await.unwrap();
+        assert_eq!(zero["apr_bps"], 0);
+        assert_eq!(zero["min_payment_cents"], 0);
+        let high = api
+            .set_credit_terms("Card", 10_000, Some(5000))
+            .await
+            .unwrap();
+        assert_eq!(high["apr_bps"], 10000);
+        let _ = rx.recv().unwrap();
+        let first_put = rx.recv().unwrap();
+        assert!(first_put.starts_with("PUT "), "{first_put}");
+        assert!(first_put.contains("\"apr_bps\":0"), "{first_put}");
+        assert!(first_put.contains("\"min_payment_cents\":0"), "{first_put}");
+        let _ = rx.recv().unwrap();
+        let second_put = rx.recv().unwrap();
+        assert!(second_put.contains("\"apr_bps\":10000"), "{second_put}");
+        assert!(
+            second_put.contains("\"min_payment_cents\":5000"),
+            "{second_put}"
+        );
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_credit_terms_omits_min_payment_when_unset() {
+        let (base, h, rx) = spawn_request_mock(vec![
+            ("/api/v1/accounts HTTP".into(), 200, card_accounts()),
+            (
+                "PUT /api/v1/accounts/a-card/credit-terms".into(),
+                200,
+                json!({"account_id": "a-card", "apr_bps": 2499, "min_payment_cents": null})
+                    .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.set_credit_terms("Card", 2499, None).await.unwrap();
+        assert_eq!(v["apr_bps"], 2499);
+        assert!(v["min_payment_cents"].is_null());
+        let _ = rx.recv().unwrap();
+        let put = rx.recv().unwrap();
+        assert!(put.contains("\"apr_bps\":2499"), "{put}");
+        assert!(
+            !put.contains("min_payment_cents"),
+            "omitted minimum must stay out of the body: {put}"
+        );
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_credit_terms_rejects_bad_apr_and_min_without_calling() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let apr = api
+            .set_credit_terms("Card", 10_001, Some(100))
+            .await
+            .unwrap_err();
+        assert!(apr.contains("apr_bps must be between 0 and 10000"), "{apr}");
+        assert!(!apr.contains("request failed"), "{apr}");
+        let neg = api.set_credit_terms("Card", -1, None).await.unwrap_err();
+        assert!(neg.contains("apr_bps must be between 0 and 10000"), "{neg}");
+        let min = api
+            .set_credit_terms("Card", 2499, Some(-1))
+            .await
+            .unwrap_err();
+        assert!(min.contains("min_payment_cents must be >= 0"), "{min}");
+        assert!(!min.contains("request failed"), "{min}");
     }
 }
