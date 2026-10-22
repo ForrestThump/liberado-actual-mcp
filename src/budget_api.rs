@@ -7,6 +7,8 @@
 //! When `LIBERADO_BUDGET_API_KEY` is set, every request sends it as
 //! `X-API-Key`. The key is never logged or copied into error text.
 
+use std::collections::{BTreeMap, HashSet};
+
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
@@ -599,6 +601,126 @@ impl BudgetApi {
         .await
     }
 
+    /// Spending for a date range from live REST.
+    ///
+    /// `group_by=category` uses `GET /api/v1/spending/by-category` (the server
+    /// already drops transfers and non-negative amounts). `week` and `day` use
+    /// `GET /api/v1/transactions` and bucket here. A `category_group` query is
+    /// sent when asked; a 400 or an unfiltered body falls back to
+    /// `GET /api/v1/categories` and a client-side filter.
+    ///
+    /// Dates are America/Chicago civil dates as stored. Weeks are Monday-start
+    /// ISO weeks of those dates, with no timezone shift.
+    pub async fn live_spending(
+        &self,
+        start_date: &str,
+        end_date: &str,
+        categories: &[String],
+        category_group: Option<&str>,
+        group_by: Option<&str>,
+    ) -> Result<Value, String> {
+        let start = require_iso_date("start_date", Some(start_date))?
+            .ok_or_else(|| "start_date is required (YYYY-MM-DD)".to_string())?;
+        let end = require_iso_date("end_date", Some(end_date))?
+            .ok_or_else(|| "end_date is required (YYYY-MM-DD)".to_string())?;
+        if start > end {
+            return Err("start_date must be on or before end_date".into());
+        }
+        let group_by = parse_group_by(group_by)?;
+        let catalog = parse_category_catalog(&self.get("/api/v1/categories").await?)?;
+        let filter = spending_filter(&catalog, categories, category_group)?;
+        let group = category_group.map(str::trim).filter(|s| !s.is_empty());
+        let (buckets, category_rows) = if group_by == "category" {
+            let rows = self
+                .fetch_spending_category_rows(&start, &end, group)
+                .await?;
+            let categories = project_category_spending(&rows, &catalog, &filter);
+            let buckets = categories.iter().map(category_bucket).collect();
+            (buckets, categories)
+        } else {
+            let txns = self
+                .fetch_spending_transactions(&start, &end, group, &filter)
+                .await?;
+            aggregate_transactions(&txns, group_by, &catalog, &filter)?
+        };
+        let sync = self.simplefin_status().await?;
+        Ok(render_spending(
+            &start,
+            &end,
+            group_by,
+            buckets,
+            category_rows,
+            sync,
+        ))
+    }
+
+    /// `GET /api/v1/simplefin/status` plus `GET /api/v1/simplefin/links`.
+    /// Never calls `POST /api/v1/simplefin/sync` or `/claim`.
+    pub async fn simplefin_status(&self) -> Result<Value, String> {
+        let status = self.get("/api/v1/simplefin/status").await?;
+        let links = self.get("/api/v1/simplefin/links").await?;
+        Ok(project_simplefin_status(&status, &links))
+    }
+
+    async fn fetch_spending_category_rows(
+        &self,
+        start: &str,
+        end: &str,
+        category_group: Option<&str>,
+    ) -> Result<Vec<Value>, String> {
+        let path = spending_by_category_path(start, end, category_group);
+        match self.get(&path).await {
+            Ok(doc) => Ok(array_field(&doc, "categories")),
+            Err(e) if category_group.is_some() && is_budget_status(&e, 400) => {
+                let doc = self
+                    .get(&spending_by_category_path(start, end, None))
+                    .await?;
+                Ok(array_field(&doc, "categories"))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_spending_transactions(
+        &self,
+        start: &str,
+        end: &str,
+        category_group: Option<&str>,
+        filter: &SpendingFilter,
+    ) -> Result<Vec<Value>, String> {
+        let ids: &[String] = if filter.active { &filter.ids } else { &[] };
+        let mut include_group = category_group.is_some();
+        let mut offset: u32 = 0;
+        let mut rows = Vec::new();
+        loop {
+            let group = if include_group { category_group } else { None };
+            let path = spending_transactions_path(start, end, ids, group, SPENDING_TX_PAGE, offset);
+            let doc = match self.get(&path).await {
+                Ok(doc) => doc,
+                Err(e) if include_group && is_budget_status(&e, 400) => {
+                    include_group = false;
+                    let retry =
+                        spending_transactions_path(start, end, ids, None, SPENDING_TX_PAGE, offset);
+                    self.get(&retry).await?
+                }
+                Err(e) => return Err(e),
+            };
+            let page = array_field(&doc, "transactions");
+            let n = page.len();
+            rows.extend(page);
+            if n < SPENDING_TX_PAGE as usize {
+                break;
+            }
+            offset = offset.saturating_add(n as u32);
+            if offset > 40_000 {
+                return Err(
+                    "too many transactions in range; narrow start_date and end_date".into(),
+                );
+            }
+        }
+        Ok(rows)
+    }
+
     pub async fn resolve_category(&self, name_or_id: &str) -> Result<String, String> {
         let v = self.get("/api/v1/categories").await?;
         resolve_category_id(&v, name_or_id)
@@ -1078,6 +1200,556 @@ fn api_key_from_env() -> Option<SecretString> {
     } else {
         Some(SecretString::new(key.to_string()))
     }
+}
+
+const SPENDING_TX_PAGE: i64 = 2000;
+
+struct CatInfo {
+    id: String,
+    name: String,
+    group: String,
+    is_income: bool,
+}
+
+struct SpendingFilter {
+    ids: Vec<String>,
+    names_lower: HashSet<String>,
+    active: bool,
+}
+
+impl SpendingFilter {
+    fn allows(&self, name: &str, category_id: Option<&str>) -> bool {
+        if !self.active {
+            return true;
+        }
+        if let Some(id) = category_id {
+            if self.ids.iter().any(|x| x.eq_ignore_ascii_case(id)) {
+                return true;
+            }
+        }
+        self.names_lower.contains(&name.to_lowercase())
+    }
+}
+
+struct CatTotal {
+    id: String,
+    name: String,
+    group: String,
+    total: i64,
+    count: i64,
+}
+
+fn is_budget_status(err: &str, code: u16) -> bool {
+    err.starts_with(&format!("budget API {code}"))
+}
+
+fn array_field(doc: &Value, key: &str) -> Vec<Value> {
+    doc.get(key)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn require_iso_date(name: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if crate::models::date_str_to_int(value).is_none() {
+        return Err(format!("Invalid {name} '{value}'; expected YYYY-MM-DD"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+pub fn parse_group_by(value: Option<&str>) -> Result<&'static str, String> {
+    match value
+        .unwrap_or("category")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "category" => Ok("category"),
+        "week" => Ok("week"),
+        "day" => Ok("day"),
+        other => Err(format!("group_by must be category|week|day, got '{other}'")),
+    }
+}
+
+fn parse_category_catalog(doc: &Value) -> Result<Vec<CatInfo>, String> {
+    let groups = doc
+        .get("category_groups")
+        .and_then(|v| v.as_array())
+        .ok_or("categories response missing category_groups")?;
+    let mut out = Vec::new();
+    for group in groups {
+        let group_name = json_str(group, "name").unwrap_or("").to_string();
+        let group_income = group
+            .get("is_income")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let cats = group
+            .get("categories")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for cat in cats {
+            let is_income = cat
+                .get("is_income")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || group_income;
+            out.push(CatInfo {
+                id: json_str(cat, "id").unwrap_or("").to_string(),
+                name: json_str(cat, "name").unwrap_or("").to_string(),
+                group: group_name.clone(),
+                is_income,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn spending_filter(
+    catalog: &[CatInfo],
+    categories: &[String],
+    category_group: Option<&str>,
+) -> Result<SpendingFilter, String> {
+    let group_name = category_group.map(str::trim).filter(|s| !s.is_empty());
+    let requested: Vec<&str> = categories
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if group_name.is_none() && requested.is_empty() {
+        return Ok(SpendingFilter {
+            ids: Vec::new(),
+            names_lower: HashSet::new(),
+            active: false,
+        });
+    }
+    let in_group: Vec<&CatInfo> = match group_name {
+        Some(group) => {
+            let rows: Vec<&CatInfo> = catalog
+                .iter()
+                .filter(|c| c.group.eq_ignore_ascii_case(group))
+                .collect();
+            if rows.is_empty() {
+                return Err(format!("unknown category group '{group}'"));
+            }
+            rows
+        }
+        None => catalog.iter().collect(),
+    };
+    let selected: Vec<&CatInfo> = if requested.is_empty() {
+        in_group
+    } else {
+        let mut matched = Vec::new();
+        for name in requested {
+            let found = catalog
+                .iter()
+                .find(|c| c.id.eq_ignore_ascii_case(name) || c.name.eq_ignore_ascii_case(name));
+            let Some(cat) = found else {
+                return Err(format!("unknown category '{name}'"));
+            };
+            if group_name.is_some() && !in_group.iter().any(|c| c.id == cat.id) {
+                return Err(format!(
+                    "category '{name}' is not in group '{}'",
+                    group_name.unwrap_or("")
+                ));
+            }
+            matched.push(cat);
+        }
+        matched
+    };
+    Ok(SpendingFilter {
+        ids: selected.iter().map(|c| c.id.clone()).collect(),
+        names_lower: selected.iter().map(|c| c.name.to_lowercase()).collect(),
+        active: true,
+    })
+}
+
+fn spending_by_category_path(start: &str, end: &str, category_group: Option<&str>) -> String {
+    let mut parts = vec![
+        format!("start_date={}", encode_query(start)),
+        format!("end_date={}", encode_query(end)),
+    ];
+    if let Some(group) = category_group.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("category_group={}", encode_query(group)));
+    }
+    format!("/api/v1/spending/by-category?{}", parts.join("&"))
+}
+
+fn spending_transactions_path(
+    start: &str,
+    end: &str,
+    category_ids: &[String],
+    category_group: Option<&str>,
+    limit: i64,
+    offset: u32,
+) -> String {
+    let mut parts = vec![
+        format!("start_date={}", encode_query(start)),
+        format!("end_date={}", encode_query(end)),
+    ];
+    for id in category_ids {
+        parts.push(format!("category_id={}", encode_query(id)));
+    }
+    if let Some(group) = category_group.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("category_group={}", encode_query(group)));
+    }
+    parts.push(format!("limit={limit}"));
+    if offset > 0 {
+        parts.push(format!("offset={offset}"));
+    }
+    format!("/api/v1/transactions?{}", parts.join("&"))
+}
+
+fn category_is_income(catalog: &[CatInfo], name: &str, category_id: Option<&str>) -> bool {
+    catalog.iter().any(|cat| {
+        let id_hit = category_id.is_some_and(|id| cat.id.eq_ignore_ascii_case(id));
+        let name_hit = !name.is_empty() && cat.name.eq_ignore_ascii_case(name);
+        (id_hit || name_hit) && cat.is_income
+    })
+}
+
+fn lookup_category<'a>(
+    catalog: &'a [CatInfo],
+    name: &str,
+    category_id: Option<&str>,
+    group: Option<&str>,
+) -> Option<&'a CatInfo> {
+    if let Some(id) = category_id {
+        if let Some(cat) = catalog.iter().find(|c| c.id.eq_ignore_ascii_case(id)) {
+            return Some(cat);
+        }
+    }
+    catalog.iter().find(|cat| {
+        cat.name.eq_ignore_ascii_case(name)
+            && group.is_none_or(|g| g.is_empty() || cat.group.eq_ignore_ascii_case(g))
+    })
+}
+
+fn has_transfer_id(tx: &Value) -> bool {
+    match tx.get("transfer_id") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn json_flag(v: &Value, key: &str) -> bool {
+    match v.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+fn include_spending_txn(tx: &Value, catalog: &[CatInfo], filter: &SpendingFilter) -> bool {
+    if has_transfer_id(tx) || json_flag(tx, "is_child") || json_flag(tx, "isChild") {
+        return false;
+    }
+    let amount = tx.get("amount_cents").and_then(|v| v.as_i64()).unwrap_or(0);
+    if amount >= 0 {
+        return false;
+    }
+    let name = json_str(tx, "category").unwrap_or("");
+    let id = json_str(tx, "category_id");
+    if category_is_income(catalog, name, id) {
+        return false;
+    }
+    filter.allows(name, id)
+}
+
+fn project_category_spending(
+    rows: &[Value],
+    catalog: &[CatInfo],
+    filter: &SpendingFilter,
+) -> Vec<Value> {
+    let mut totals = Vec::new();
+    for row in rows {
+        let name = json_str(row, "category_name").unwrap_or("Uncategorized");
+        let group = json_str(row, "group_name").unwrap_or("");
+        let info = lookup_category(catalog, name, None, Some(group));
+        if info.is_some_and(|c| c.is_income) || category_is_income(catalog, name, None) {
+            continue;
+        }
+        if !filter.allows(name, info.map(|c| c.id.as_str())) {
+            continue;
+        }
+        let total = json_i64(row, "total_cents").unwrap_or(0);
+        let count = json_i64(row, "transaction_count").unwrap_or(0);
+        if total == 0 && count == 0 {
+            continue;
+        }
+        totals.push(CatTotal {
+            id: info.map(|c| c.id.clone()).unwrap_or_default(),
+            name: name.to_string(),
+            group: info
+                .map(|c| c.group.clone())
+                .filter(|g| !g.is_empty())
+                .unwrap_or_else(|| group.to_string()),
+            total,
+            count,
+        });
+    }
+    totals.sort_by(|a, b| a.total.cmp(&b.total).then_with(|| a.name.cmp(&b.name)));
+    totals.iter().map(category_value).collect()
+}
+
+fn category_value(cat: &CatTotal) -> Value {
+    json!({
+        "category_id": cat.id,
+        "category_name": cat.name,
+        "group_name": cat.group,
+        "total_cents": cat.total,
+        "total_display": crate::models::format_amount(cat.total),
+        "transaction_count": cat.count,
+    })
+}
+
+fn category_bucket(cat: &Value) -> Value {
+    let mut bucket = cat.clone();
+    bucket["key"] = cat.get("category_name").cloned().unwrap_or(json!(""));
+    bucket
+}
+
+fn aggregate_transactions(
+    txns: &[Value],
+    group_by: &str,
+    catalog: &[CatInfo],
+    filter: &SpendingFilter,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    struct Acc {
+        total: i64,
+        count: i64,
+        start: String,
+        end: String,
+    }
+    let mut buckets: BTreeMap<String, Acc> = BTreeMap::new();
+    let mut cats: BTreeMap<String, CatTotal> = BTreeMap::new();
+    for tx in txns {
+        if !include_spending_txn(tx, catalog, filter) {
+            continue;
+        }
+        let amount = json_i64(tx, "amount_cents").unwrap_or(0);
+        let date = json_str(tx, "date").unwrap_or("");
+        if crate::models::date_str_to_int(date).is_none() {
+            return Err(format!("transaction date '{date}' is not YYYY-MM-DD"));
+        }
+        let name = json_str(tx, "category").unwrap_or("");
+        let display_name = if name.is_empty() {
+            "Uncategorized"
+        } else {
+            name
+        };
+        let id = json_str(tx, "category_id");
+        let info = lookup_category(catalog, display_name, id, None);
+        let (bucket_key, start, end) = match group_by {
+            "week" => {
+                let week = iso_week(date)?;
+                (week.key, week.start, week.end)
+            }
+            _ => (date.to_string(), date.to_string(), date.to_string()),
+        };
+        let bucket = buckets.entry(bucket_key).or_insert_with(|| Acc {
+            total: 0,
+            count: 0,
+            start,
+            end,
+        });
+        bucket.total += amount;
+        bucket.count += 1;
+        let cat_key = info
+            .map(|c| c.id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| display_name.to_lowercase());
+        let cat = cats.entry(cat_key).or_insert_with(|| CatTotal {
+            id: info.map(|c| c.id.clone()).unwrap_or_default(),
+            name: display_name.to_string(),
+            group: info.map(|c| c.group.clone()).unwrap_or_default(),
+            total: 0,
+            count: 0,
+        });
+        cat.total += amount;
+        cat.count += 1;
+    }
+    let bucket_rows = buckets
+        .into_iter()
+        .map(|(key, acc)| {
+            json!({
+                "key": key,
+                "start_date": acc.start,
+                "end_date": acc.end,
+                "total_cents": acc.total,
+                "total_display": crate::models::format_amount(acc.total),
+                "transaction_count": acc.count,
+            })
+        })
+        .collect();
+    let mut category_rows: Vec<CatTotal> = cats.into_values().collect();
+    category_rows.sort_by(|a, b| a.total.cmp(&b.total).then_with(|| a.name.cmp(&b.name)));
+    Ok((
+        bucket_rows,
+        category_rows.iter().map(category_value).collect(),
+    ))
+}
+
+fn render_spending(
+    start: &str,
+    end: &str,
+    group_by: &str,
+    buckets: Vec<Value>,
+    categories: Vec<Value>,
+    sync: Value,
+) -> Value {
+    let total_cents: i64 = categories
+        .iter()
+        .filter_map(|c| json_i64(c, "total_cents"))
+        .sum();
+    let transaction_count: i64 = categories
+        .iter()
+        .filter_map(|c| json_i64(c, "transaction_count"))
+        .sum();
+    json!({
+        "start_date": start,
+        "end_date": end,
+        "group_by": group_by,
+        "timezone": "America/Chicago",
+        "buckets": buckets,
+        "categories": categories,
+        "total_cents": total_cents,
+        "total_display": crate::models::format_amount(total_cents),
+        "transaction_count": transaction_count,
+        "sync": sync,
+    })
+}
+
+/// Monday-start ISO week of a stored America/Chicago civil date.
+/// The date is already the Chicago calendar day; it is not shifted from UTC.
+struct IsoWeek {
+    key: String,
+    start: String,
+    end: String,
+}
+
+fn iso_week(date: &str) -> Result<IsoWeek, String> {
+    let n = crate::models::date_str_to_int(date)
+        .ok_or_else(|| format!("Invalid date '{date}'; expected YYYY-MM-DD"))?;
+    let days = days_from_civil(n / 10000, (n / 100) % 100, n % 100);
+    let dow = (days + 3).rem_euclid(7) + 1;
+    let thursday = days + 4 - dow;
+    let iso_year = civil_from_days(thursday) / 10000;
+    let jan4 = days_from_civil(iso_year, 1, 4);
+    let jan4_dow = (jan4 + 3).rem_euclid(7) + 1;
+    let week1_monday = jan4 - (jan4_dow - 1);
+    let week = (days - week1_monday) / 7 + 1;
+    let monday = days - (dow - 1);
+    Ok(IsoWeek {
+        key: format!("{iso_year}-W{week:02}"),
+        start: crate::models::date_int_to_str(civil_from_days(monday)),
+        end: crate::models::date_int_to_str(civil_from_days(monday + 6)),
+    })
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> i64 {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    year * 10_000 + m * 100 + (doy - (153 * mp + 2) / 5 + 1)
+}
+
+pub fn project_simplefin_status(status: &Value, links_doc: &Value) -> Value {
+    let configured = status
+        .get("configured")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let accounts = project_simplefin_links(links_doc);
+    let cursor = json_i64(status, "cursor_epoch").or_else(|| min_link_cursor(&accounts));
+    let mut out = json!({
+        "configured": configured,
+        "cursor_epoch": cursor,
+        "linked_accounts": accounts,
+    });
+    if let Some(days) = status.get("lookback_days").filter(|v| !v.is_null()) {
+        out["lookback_days"] = days.clone();
+    }
+    match status
+        .get("last_successful_sync_at")
+        .filter(|v| !v.is_null())
+    {
+        Some(ts) => {
+            out["last_successful_sync_at"] = ts.clone();
+        }
+        None => {
+            out["note"] = json!(sync_freshness_note(cursor));
+        }
+    }
+    out
+}
+
+fn sync_freshness_note(cursor: Option<i64>) -> String {
+    match cursor {
+        Some(epoch) => format!(
+            "Exact last-sync time is unavailable (no last_successful_sync_at). \
+             cursor_epoch {epoch} is a SimpleFIN fetch cursor, not a last-sync timestamp."
+        ),
+        None => "Exact last-sync time is unavailable (no last_successful_sync_at).".into(),
+    }
+}
+
+fn project_simplefin_links(doc: &Value) -> Vec<Value> {
+    let rows = doc
+        .get("links")
+        .and_then(|v| v.as_array())
+        .or_else(|| doc.as_array());
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+    rows.iter()
+        .map(|link| {
+            let mut out = json!({
+                "account_name": json_str(link, "account_name")
+                    .or_else(|| json_str(link, "name"))
+                    .unwrap_or(""),
+                "account_id": json_str(link, "account_id").unwrap_or(""),
+                "simplefin_account_id": json_str(link, "simplefin_account_id").unwrap_or(""),
+            });
+            copy_present(&mut out, link, "cursor_epoch");
+            copy_present(&mut out, link, "last_sync_at");
+            copy_present(&mut out, link, "last_sync_attempt_at");
+            copy_present(&mut out, link, "last_sync_error");
+            out
+        })
+        .collect()
+}
+
+fn copy_present(out: &mut Value, src: &Value, key: &str) {
+    if let Some(value) = src.get(key).filter(|v| !v.is_null()) {
+        out[key] = value.clone();
+    }
+}
+
+fn min_link_cursor(accounts: &[Value]) -> Option<i64> {
+    accounts
+        .iter()
+        .filter_map(|a| json_i64(a, "cursor_epoch"))
+        .min()
 }
 
 fn encode_query(s: &str) -> String {
@@ -2125,6 +2797,347 @@ mod tests {
             "liberado-budget API rejected the key (401); check LIBERADO_BUDGET_API_KEY"
         );
         assert!(!err.contains(key), "error must not echo the API key");
+        h.join().unwrap();
+    }
+
+    fn sample_categories() -> Value {
+        json!({
+            "category_groups": [
+                {
+                    "id": "g-food",
+                    "name": "Food",
+                    "is_income": false,
+                    "categories": [
+                        {"id": "c-groc", "name": "Groceries", "is_income": false},
+                        {"id": "c-eat", "name": "Eating Out", "is_income": false}
+                    ]
+                },
+                {
+                    "id": "g-home",
+                    "name": "Home",
+                    "is_income": false,
+                    "categories": [
+                        {"id": "c-rent", "name": "Rent", "is_income": false}
+                    ]
+                },
+                {
+                    "id": "g-in",
+                    "name": "Income",
+                    "is_income": true,
+                    "categories": [
+                        {"id": "c-pay", "name": "Paycheck", "is_income": true}
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn status_without_sync_time() -> String {
+        json!({
+            "configured": true,
+            "lookback_days": 30,
+            "linked_accounts": 1
+        })
+        .to_string()
+    }
+
+    fn links_with_cursor() -> String {
+        json!({
+            "links": [{
+                "simplefin_account_id": "ACT-1",
+                "account_id": "a-chk",
+                "account_name": "Checking",
+                "cursor_epoch": 1_700_000_000
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn iso_weeks_are_monday_start_chicago_dates() {
+        let first = iso_week("1970-01-01").unwrap();
+        assert_eq!(first.key, "1970-W01");
+        assert_eq!(first.start, "1969-12-29");
+        assert_eq!(first.end, "1970-01-04");
+        assert_eq!(iso_week("2021-01-01").unwrap().key, "2020-W53");
+        let week = iso_week("2025-12-29").unwrap();
+        assert_eq!(week.key, "2026-W01");
+        assert_eq!(week.start, "2025-12-29");
+        assert_eq!(iso_week("2026-01-01").unwrap().key, "2026-W01");
+    }
+
+    #[test]
+    fn simplefin_status_note_uses_cursor_when_sync_time_is_absent() {
+        let status = json!({"configured": true, "lookback_days": 30});
+        let links = json!({
+            "links": [
+                {"account_name": "Checking", "account_id": "a", "simplefin_account_id": "s", "cursor_epoch": 50, "last_sync_error": "timeout"},
+                {"account_name": "Card", "account_id": "b", "simplefin_account_id": "t", "cursor_epoch": 80}
+            ]
+        });
+        let v = project_simplefin_status(&status, &links);
+        assert_eq!(v["configured"], true);
+        assert_eq!(v["cursor_epoch"], 50);
+        assert!(v.get("last_successful_sync_at").is_none());
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.contains("Exact last-sync time is unavailable"),
+            "{note}"
+        );
+        assert!(note.contains("cursor_epoch 50"), "{note}");
+        assert_eq!(v["linked_accounts"][0]["last_sync_error"], "timeout");
+        assert!(v["linked_accounts"][0].get("last_sync_at").is_none());
+        assert!(v["linked_accounts"][1].get("last_sync_error").is_none());
+    }
+
+    #[test]
+    fn simplefin_status_keeps_sync_time_and_optional_link_fields() {
+        let status = json!({
+            "configured": true,
+            "last_successful_sync_at": "2026-10-20T15:00:00Z",
+            "cursor_epoch": 9
+        });
+        let links = json!({
+            "links": [{
+                "account_name": "Checking",
+                "account_id": "a-chk",
+                "simplefin_account_id": "ACT-1",
+                "cursor_epoch": 50,
+                "last_sync_at": "2026-10-20T15:00:00Z",
+                "last_sync_attempt_at": "2026-10-20T15:00:02Z"
+            }]
+        });
+        let v = project_simplefin_status(&status, &links);
+        assert_eq!(v["last_successful_sync_at"], "2026-10-20T15:00:00Z");
+        assert_eq!(v["cursor_epoch"], 9);
+        assert!(v.get("note").is_none());
+        assert_eq!(
+            v["linked_accounts"][0]["last_sync_at"],
+            "2026-10-20T15:00:00Z"
+        );
+        assert_eq!(
+            v["linked_accounts"][0]["last_sync_attempt_at"],
+            "2026-10-20T15:00:02Z"
+        );
+    }
+
+    #[test]
+    fn spending_rows_drop_transfers_income_and_other_groups() {
+        let catalog = parse_category_catalog(&sample_categories()).unwrap();
+        let filter = spending_filter(&catalog, &[], Some("Food")).unwrap();
+        let txns = vec![
+            json!({"date": "2026-10-19", "amount_cents": -1000, "category": "Groceries"}),
+            json!({"date": "2026-10-21", "amount_cents": -250, "category": "Eating Out"}),
+            json!({"date": "2026-10-21", "amount_cents": -9999, "category": "Rent", "transfer_id": "xfer-1"}),
+            json!({"date": "2026-10-21", "amount_cents": -4000, "category": "Rent"}),
+            json!({"date": "2026-10-21", "amount_cents": 500000, "category": "Paycheck"}),
+            json!({"date": "2026-10-21", "amount_cents": -50, "category": "Paycheck"}),
+        ];
+        let (buckets, cats) = aggregate_transactions(&txns, "week", &catalog, &filter).unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0]["total_cents"], -1250);
+        assert_eq!(cats.len(), 2);
+        assert_eq!(cats[0]["category_name"], "Groceries");
+        assert_eq!(cats[0]["total_cents"], -1000);
+        assert_eq!(cats[1]["category_name"], "Eating Out");
+        assert_eq!(cats[1]["transaction_count"], 1);
+    }
+
+    #[test]
+    fn spending_rows_group_by_day() {
+        let catalog = parse_category_catalog(&sample_categories()).unwrap();
+        let filter = spending_filter(&catalog, &[], None).unwrap();
+        let txns = vec![
+            json!({"date": "2026-10-19", "amount_cents": -1000, "category": "Groceries"}),
+            json!({"date": "2026-10-19", "amount_cents": -250, "category": "Eating Out"}),
+            json!({"date": "2026-10-20", "amount_cents": -400, "category": "Rent"}),
+            json!({"date": "2026-10-20", "amount_cents": 100, "category": "Rent"}),
+        ];
+        let (buckets, cats) = aggregate_transactions(&txns, "day", &catalog, &filter).unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0]["key"], "2026-10-19");
+        assert_eq!(buckets[0]["start_date"], "2026-10-19");
+        assert_eq!(buckets[0]["end_date"], "2026-10-19");
+        assert_eq!(buckets[0]["total_cents"], -1250);
+        assert_eq!(buckets[0]["transaction_count"], 2);
+        assert_eq!(buckets[1]["key"], "2026-10-20");
+        assert_eq!(buckets[1]["total_cents"], -400);
+        assert_eq!(cats.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn live_spending_falls_back_when_category_group_is_rejected() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/categories".into(),
+                200,
+                sample_categories().to_string(),
+            ),
+            (
+                "/api/v1/spending/by-category?start_date=2026-10-01&end_date=2026-10-31&category_group=Food"
+                    .into(),
+                400,
+                json!({"error": "unknown parameter category_group"}).to_string(),
+            ),
+            (
+                "/api/v1/spending/by-category?start_date=2026-10-01&end_date=2026-10-31".into(),
+                200,
+                json!({
+                    "categories": [
+                        {"category_name": "Groceries", "group_name": "Food", "total_cents": -4200, "transaction_count": 3},
+                        {"category_name": "Rent", "group_name": "Home", "total_cents": -110000, "transaction_count": 1},
+                        {"category_name": "Paycheck", "group_name": "Income", "total_cents": -100, "transaction_count": 1}
+                    ]
+                })
+                .to_string(),
+            ),
+            (
+                "/api/v1/simplefin/status".into(),
+                200,
+                status_without_sync_time(),
+            ),
+            ("/api/v1/simplefin/links".into(), 200, links_with_cursor()),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .live_spending("2026-10-01", "2026-10-31", &[], Some("Food"), None)
+            .await
+            .unwrap();
+        assert_eq!(v["group_by"], "category");
+        assert_eq!(v["categories"].as_array().unwrap().len(), 1);
+        assert_eq!(v["categories"][0]["category_name"], "Groceries");
+        assert_eq!(v["categories"][0]["category_id"], "c-groc");
+        assert_eq!(v["categories"][0]["total_cents"], -4200);
+        assert_eq!(v["total_cents"], -4200);
+        assert_eq!(v["transaction_count"], 3);
+        assert_eq!(v["buckets"][0]["key"], "Groceries");
+        let note = v["sync"]["note"].as_str().unwrap();
+        assert!(
+            note.contains("Exact last-sync time is unavailable"),
+            "{note}"
+        );
+        assert!(note.contains("1700000000"), "{note}");
+        assert!(v["sync"].get("last_successful_sync_at").is_none());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_spending_filters_ignored_category_group() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/categories".into(),
+                200,
+                sample_categories().to_string(),
+            ),
+            (
+                "/api/v1/spending/by-category?start_date=2026-10-01&end_date=2026-10-31&category_group=Food"
+                    .into(),
+                200,
+                json!({
+                    "categories": [
+                        {"category_name": "Groceries", "group_name": "Food", "total_cents": -4200, "transaction_count": 3},
+                        {"category_name": "Rent", "group_name": "Home", "total_cents": -110000, "transaction_count": 1}
+                    ]
+                })
+                .to_string(),
+            ),
+            (
+                "/api/v1/simplefin/status".into(),
+                200,
+                json!({"configured": true, "last_successful_sync_at": "2026-10-20T15:00:00Z"}).to_string(),
+            ),
+            ("/api/v1/simplefin/links".into(), 200, json!({"links": []}).to_string()),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .live_spending(
+                "2026-10-01",
+                "2026-10-31",
+                &["c-groc".into()],
+                Some("Food"),
+                Some("category"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["categories"].as_array().unwrap().len(), 1);
+        assert_eq!(v["categories"][0]["category_name"], "Groceries");
+        assert_eq!(v["sync"]["last_successful_sync_at"], "2026-10-20T15:00:00Z");
+        assert!(v["sync"].get("note").is_none());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_spending_weeks_use_transactions_and_skip_transfers() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/categories".into(),
+                200,
+                sample_categories().to_string(),
+            ),
+            (
+                "/api/v1/transactions?start_date=2026-10-01&end_date=2026-10-31&limit=2000".into(),
+                200,
+                json!({
+                    "transactions": [
+                        {"id": "t1", "date": "2026-10-19", "amount_cents": -1000, "category": "Groceries"},
+                        {"id": "t2", "date": "2026-10-21", "amount_cents": -500, "category": "Groceries"},
+                        {"id": "t3", "date": "2026-10-26", "amount_cents": -2000, "category": "Rent"},
+                        {"id": "t4", "date": "2026-10-21", "amount_cents": -9000, "category": "Groceries", "transfer_id": "pair"},
+                        {"id": "t5", "date": "2026-10-15", "amount_cents": 250000, "category": "Paycheck"}
+                    ]
+                })
+                .to_string(),
+            ),
+            (
+                "/api/v1/simplefin/status".into(),
+                200,
+                status_without_sync_time(),
+            ),
+            ("/api/v1/simplefin/links".into(), 200, links_with_cursor()),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .live_spending("2026-10-01", "2026-10-31", &[], None, Some("week"))
+            .await
+            .unwrap();
+        assert_eq!(v["group_by"], "week");
+        assert_eq!(v["timezone"], "America/Chicago");
+        let buckets = v["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0]["key"], iso_week("2026-10-19").unwrap().key);
+        assert_eq!(
+            buckets[0]["start_date"],
+            iso_week("2026-10-19").unwrap().start
+        );
+        assert_eq!(buckets[0]["total_cents"], -1500);
+        assert_eq!(buckets[1]["total_cents"], -2000);
+        assert_eq!(v["total_cents"], -3500);
+        assert_eq!(v["transaction_count"], 3);
+        assert_eq!(v["categories"][0]["category_name"], "Rent");
+        assert_eq!(v["categories"][1]["category_name"], "Groceries");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn simplefin_status_reads_status_and_links_only() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "/api/v1/simplefin/status".into(),
+                200,
+                status_without_sync_time(),
+            ),
+            ("/api/v1/simplefin/links".into(), 200, links_with_cursor()),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.simplefin_status().await.unwrap();
+        assert_eq!(v["configured"], true);
+        assert_eq!(v["linked_accounts"][0]["account_name"], "Checking");
+        assert_eq!(v["cursor_epoch"], 1_700_000_000);
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.contains("Exact last-sync time is unavailable"),
+            "{note}"
+        );
         h.join().unwrap();
     }
 }

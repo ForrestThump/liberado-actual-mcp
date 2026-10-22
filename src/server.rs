@@ -1073,4 +1073,55 @@ impl ActualServer {
             .map_err(budget_api_error)?;
         json_result(&v)
     }
+
+    #[tool(
+        "Spending totals from live REST (authoritative), not ACTUAL_DB_PATH. \
+            start_date and end_date are required YYYY-MM-DD. \
+            categories is an optional array of category names or ids. \
+            category_group is an optional category group name. If the server \
+            rejects or ignores category_group, the group is resolved with \
+            GET /api/v1/categories and filtered here. \
+            group_by is category (default), week, or day. Weeks are Monday-start \
+            ISO weeks of the stored America/Chicago dates. \
+            Transfers (rows with transfer_id) and income are excluded. \
+            Returns per-bucket and per-category totals in integer cents plus display, \
+            transaction counts, and a sync object from SimpleFIN status. \
+            Does not call SimpleFIN sync or claim."
+    )]
+    async fn live_spending(
+        &self,
+        start_date: String,
+        end_date: String,
+        categories: Option<Vec<String>>,
+        category_group: Option<String>,
+        group_by: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let categories = categories.unwrap_or_default();
+        let v = api
+            .live_spending(
+                &start_date,
+                &end_date,
+                &categories,
+                category_group.as_deref(),
+                group_by.as_deref(),
+            )
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "SimpleFIN link status from live REST (authoritative). \
+            GET /api/v1/simplefin/status and GET /api/v1/simplefin/links. \
+            Returns configured, cursor_epoch, and linked accounts with account name. \
+            last_sync_at, last_sync_attempt_at, and last_sync_error are included \
+            when the server sends them. Does not call POST /api/v1/simplefin/sync \
+            or POST /api/v1/simplefin/claim."
+    )]
+    async fn simplefin_status(&self) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api.simplefin_status().await.map_err(budget_api_error)?;
+        json_result(&v)
+    }
 }
