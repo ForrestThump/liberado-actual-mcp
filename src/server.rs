@@ -1124,4 +1124,21 @@ impl ActualServer {
         let v = api.simplefin_status().await.map_err(budget_api_error)?;
         json_result(&v)
     }
+
+    #[tool(
+        "Predicted bills and paydays from live REST (authoritative). \
+            GET /api/v1/upcoming. \
+            days is an optional horizon from 1 to 365 (server default 60). \
+            lookback_months is optional history from 1 to 36 (server default 6). \
+            Amounts are ledger-signed integer cents. kind is income (payday) or expense (bill). \
+            Does not create or delete schedules."
+    )]
+    async fn upcoming(&self, days: Option<i64>, lookback_months: Option<i64>) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .upcoming(days, lookback_months)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
 }

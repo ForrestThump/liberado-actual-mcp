@@ -601,6 +601,41 @@ impl BudgetApi {
         .await
     }
 
+    /// Predicted bills and paydays (`GET /api/v1/upcoming`).
+    ///
+    /// `days` (1..=365) and `lookback_months` (1..=36) are sent only when set.
+    /// Values outside those ranges are rejected here; the server would clamp
+    /// them. Does not create or delete schedules.
+    pub async fn upcoming(
+        &self,
+        days: Option<i64>,
+        lookback_months: Option<i64>,
+    ) -> Result<Value, String> {
+        if let Some(days) = days {
+            if !(1..=365).contains(&days) {
+                return Err("days must be between 1 and 365".into());
+            }
+        }
+        if let Some(months) = lookback_months {
+            if !(1..=36).contains(&months) {
+                return Err("lookback_months must be between 1 and 36".into());
+            }
+        }
+        let mut parts = Vec::new();
+        if let Some(days) = days {
+            parts.push(format!("days={days}"));
+        }
+        if let Some(months) = lookback_months {
+            parts.push(format!("lookback_months={months}"));
+        }
+        let path = if parts.is_empty() {
+            "/api/v1/upcoming".to_string()
+        } else {
+            format!("/api/v1/upcoming?{}", parts.join("&"))
+        };
+        self.get(&path).await
+    }
+
     /// Spending for a date range from live REST.
     ///
     /// `group_by=category` uses `GET /api/v1/spending/by-category` (the server
@@ -3139,5 +3174,77 @@ mod tests {
             "{note}"
         );
         h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upcoming_passes_days_and_lookback() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/upcoming?days=14&lookback_months=3".into(),
+            200,
+            json!({
+                "today": "2026-10-21",
+                "horizon_days": 14,
+                "bills": [
+                    {
+                        "id": "p:c",
+                        "payee_name": "Landlord",
+                        "category_name": "Rent",
+                        "mean_amount_cents": -150000,
+                        "next_date": "2026-11-01",
+                        "kind": "expense"
+                    },
+                    {
+                        "id": "pay",
+                        "payee_name": "Employer",
+                        "category_name": "Paycheck",
+                        "mean_amount_cents": 250000,
+                        "next_date": "2026-10-30",
+                        "kind": "income"
+                    }
+                ]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.upcoming(Some(14), Some(3)).await.unwrap();
+        assert_eq!(v["today"], "2026-10-21");
+        assert_eq!(v["horizon_days"], 14);
+        assert_eq!(v["bills"][0]["kind"], "expense");
+        assert_eq!(v["bills"][0]["mean_amount_cents"], -150000);
+        assert_eq!(v["bills"][1]["kind"], "income");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upcoming_omits_query_when_unset() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/upcoming HTTP".into(),
+            200,
+            json!({"today": "2026-10-21", "horizon_days": 60, "bills": []}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.upcoming(None, None).await.unwrap();
+        assert_eq!(v["horizon_days"], 60);
+        assert!(v["bills"].as_array().unwrap().is_empty());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upcoming_rejects_out_of_range_query() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let days = api.upcoming(Some(0), None).await.unwrap_err();
+        assert!(days.contains("days must be between 1 and 365"), "{days}");
+        let days = api.upcoming(Some(366), Some(6)).await.unwrap_err();
+        assert!(days.contains("days must be between 1 and 365"), "{days}");
+        let months = api.upcoming(Some(30), Some(0)).await.unwrap_err();
+        assert!(
+            months.contains("lookback_months must be between 1 and 36"),
+            "{months}"
+        );
+        let months = api.upcoming(None, Some(37)).await.unwrap_err();
+        assert!(
+            months.contains("lookback_months must be between 1 and 36"),
+            "{months}"
+        );
     }
 }
