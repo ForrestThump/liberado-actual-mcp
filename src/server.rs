@@ -239,7 +239,11 @@ impl ActualServer {
 
 // ── Tools ─────────────────────────────────────────────────────────────────────
 
-#[turbomcp::server(name = "actual-budget-mcp", version = "0.1.0")]
+#[turbomcp::server(
+    name = "actual-budget-mcp",
+    version = "0.1.0",
+    description = "Live REST tools (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `live_spending`, `simplefin_status`, `upcoming`, `get_summary`, `list_loans`, `loan_projection`, budget_api_*) are authoritative; ACTUAL_DB_PATH SQLite tools can lag; writes go through REST only."
+)]
 impl ActualServer {
     #[tool(
         "List all accounts with their current balances from ACTUAL_DB_PATH. \
