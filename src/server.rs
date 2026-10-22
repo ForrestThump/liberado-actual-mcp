@@ -19,7 +19,10 @@ fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
 /// client errors (4xx) surface as invalid-params / permission-denied instead of
 /// a generic internal error, which agents cannot act on.
 fn budget_api_error(e: String) -> McpError {
-    if e.starts_with("budget API 401") || e.starts_with("budget API 403") {
+    if e.starts_with("budget API 401")
+        || e.starts_with("budget API 403")
+        || e.contains("rejected the key (401)")
+    {
         McpError::permission_denied(e)
     } else if e.starts_with("budget API 4") {
         McpError::invalid_params(e)

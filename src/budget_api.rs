@@ -4,8 +4,16 @@
 //! transactions, envelope months, loans, coaching summary, uncategorized
 //! listings) go here so they hit the running Liberado Budget server rather
 //! than a Syncthing mirror. Base URL comes from `LIBERADO_BUDGET_API_URL`.
+//! When `LIBERADO_BUDGET_API_KEY` is set, every request sends it as
+//! `X-API-Key`. The key is never logged or copied into error text.
 
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
+
+/// Tool-facing 401. The response body is dropped so a server that echoes the
+/// header cannot leak `LIBERADO_BUDGET_API_KEY` through this error.
+const API_KEY_REJECTED: &str =
+    "liberado-budget API rejected the key (401); check LIBERADO_BUDGET_API_KEY";
 
 #[cfg(test)]
 use std::io::{Read, Write};
@@ -18,6 +26,9 @@ use std::thread;
 pub struct BudgetApi {
     base: String,
     client: reqwest::Client,
+    /// Present only when `LIBERADO_BUDGET_API_KEY` is non-empty.
+    /// `SecretString` redacts `Debug` so the key cannot leak through a log.
+    api_key: Option<SecretString>,
 }
 
 impl BudgetApi {
@@ -30,19 +41,45 @@ impl BudgetApi {
         Some(Self {
             base,
             client: reqwest::Client::new(),
+            api_key: api_key_from_env(),
         })
     }
 
     #[cfg(test)]
     fn new(base: impl Into<String>) -> Self {
+        Self::with_key(base, None)
+    }
+
+    #[cfg(test)]
+    fn with_key(base: impl Into<String>, api_key: Option<&str>) -> Self {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            api_key: api_key
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(|k| SecretString::new(k.to_string())),
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let mut req = self.client.request(method, self.url(path));
+        if let Some(key) = &self.api_key {
+            let value =
+                reqwest::header::HeaderValue::from_str(key.expose_secret()).map_err(|_| {
+                    "LIBERADO_BUDGET_API_KEY is not a valid HTTP header value".to_string()
+                })?;
+            req = req.header("X-API-Key", value);
+        }
+        Ok(req)
     }
 
     async fn send(
@@ -51,7 +88,7 @@ impl BudgetApi {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, String> {
-        let mut req = self.client.request(method, self.url(path));
+        let mut req = self.request(method, path)?;
         if let Some(b) = body {
             req = req.json(b);
         }
@@ -64,6 +101,11 @@ impl BudgetApi {
 
     async fn json_response(resp: reqwest::Response) -> Result<Value, String> {
         let status = resp.status();
+        if status.as_u16() == 401 {
+            // Drain the body so the connection can close, but do not include it.
+            let _ = resp.text().await;
+            return Err(API_KEY_REJECTED.to_string());
+        }
         let text = resp
             .text()
             .await
@@ -92,8 +134,7 @@ impl BudgetApi {
         body: &str,
     ) -> Result<Value, String> {
         let resp = self
-            .client
-            .request(reqwest::Method::POST, self.url(path))
+            .request(reqwest::Method::POST, path)?
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(body.to_string())
             .send()
@@ -1029,6 +1070,16 @@ fn json_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+fn api_key_from_env() -> Option<SecretString> {
+    let raw = std::env::var("LIBERADO_BUDGET_API_KEY").ok()?;
+    let key = raw.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(SecretString::new(key.to_string()))
+    }
+}
+
 fn encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1091,6 +1142,54 @@ pub fn spawn_json_mock(routes: Vec<(String, u16, String)>) -> (String, thread::J
                 line.contains(&expect_path),
                 "expected path {expect_path} in {line}"
             );
+            let resp = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            drop(stream);
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Like [`spawn_json_mock`], but checks `X-API-Key` without printing the value.
+/// `expect_key: Some(k)` requires that exact header. `None` requires it absent.
+#[cfg(test)]
+fn spawn_api_key_mock(
+    routes: Vec<(String, u16, String, Option<String>)>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for (expect_path, status, body, expect_key) in routes {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let req = String::from_utf8_lossy(&buf);
+            let line = req.lines().next().unwrap_or("");
+            assert!(
+                line.contains(&expect_path),
+                "expected path {expect_path} in {line}"
+            );
+            let got = req.lines().find_map(|header| {
+                let (name, value) = header.split_once(':')?;
+                if name.eq_ignore_ascii_case("x-api-key") {
+                    Some(value.trim().to_string())
+                } else {
+                    None
+                }
+            });
+            match &expect_key {
+                Some(key) => assert!(
+                    got.as_deref() == Some(key.as_str()),
+                    "X-API-Key missing or mismatched"
+                ),
+                None => assert!(got.is_none(), "X-API-Key sent when unset"),
+            }
             let resp = format!(
                 "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -1952,6 +2051,80 @@ mod tests {
         let err = api.get_live_budget_month("2026-10").await.unwrap_err();
         assert!(err.contains("ForrestThump/liberado-budget"), "{err}");
         assert!(!err.contains("\"allocation_cents\": 85292"), "{err}");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn requests_send_api_key_header_when_configured() {
+        let key = "unit-test-api-key";
+        let (base, h) = spawn_api_key_mock(vec![(
+            "/api/v1/loans".into(),
+            200,
+            json!({"loans": []}).to_string(),
+            Some(key.into()),
+        )]);
+        let api = BudgetApi::with_key(base, Some(key));
+        let v = api.list_loans().await.unwrap();
+        assert!(v["loans"].as_array().unwrap().is_empty());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn requests_omit_api_key_header_when_unset() {
+        let (base, h) = spawn_api_key_mock(vec![(
+            "/api/v1/loans".into(),
+            200,
+            json!({"loans": []}).to_string(),
+            None,
+        )]);
+        let api = BudgetApi::with_key(base, Some("   "));
+        let v = api.list_loans().await.unwrap();
+        assert!(v["loans"].as_array().unwrap().is_empty());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_text_sends_api_key_header() {
+        let key = "unit-test-api-key";
+        let (base, h) = spawn_api_key_mock(vec![
+            (
+                "/api/v1/accounts".into(),
+                200,
+                sample_accounts().to_string(),
+                Some(key.into()),
+            ),
+            (
+                "/api/v1/import/csv?account_id=a-chk&format=auto".into(),
+                200,
+                json!({"report": {"inserted": 1}}).to_string(),
+                Some(key.into()),
+            ),
+        ]);
+        let api = BudgetApi::with_key(base, Some(key));
+        let v = api
+            .import_csv("Checking", None, Some("a,b\n"), None)
+            .await
+            .unwrap();
+        assert_eq!(v["report"]["inserted"], 1);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_error_names_the_env_var_and_drops_the_body() {
+        let key = "unit-test-api-key";
+        let (base, h) = spawn_api_key_mock(vec![(
+            "/api/v1/loans".into(),
+            401,
+            format!(r#"{{"error":"unauthorized","echo":"{key}"}}"#),
+            Some(key.into()),
+        )]);
+        let api = BudgetApi::with_key(base, Some(key));
+        let err = api.list_loans().await.unwrap_err();
+        assert_eq!(
+            err,
+            "liberado-budget API rejected the key (401); check LIBERADO_BUDGET_API_KEY"
+        );
+        assert!(!err.contains(key), "error must not echo the API key");
         h.join().unwrap();
     }
 }
