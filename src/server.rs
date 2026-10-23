@@ -19,7 +19,10 @@ fn json_result<T: serde::Serialize>(val: &T) -> McpResult<String> {
 /// client errors (4xx) surface as invalid-params / permission-denied instead of
 /// a generic internal error, which agents cannot act on.
 fn budget_api_error(e: String) -> McpError {
-    if e.starts_with("budget API 401") || e.starts_with("budget API 403") {
+    if e.starts_with("budget API 401")
+        || e.starts_with("budget API 403")
+        || e.contains("rejected the key (401)")
+    {
         McpError::permission_denied(e)
     } else if e.starts_with("budget API 4") {
         McpError::invalid_params(e)
@@ -236,7 +239,11 @@ impl ActualServer {
 
 // ── Tools ─────────────────────────────────────────────────────────────────────
 
-#[turbomcp::server(name = "actual-budget-mcp", version = "0.1.0")]
+#[turbomcp::server(
+    name = "actual-budget-mcp",
+    version = "0.1.0",
+    description = "Live REST tools (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `live_spending`, `simplefin_status`, `upcoming`, `get_summary`, `list_loans`, `loan_projection`, budget_api_*) are authoritative; ACTUAL_DB_PATH SQLite tools can lag; writes go through REST only."
+)]
 impl ActualServer {
     #[tool(
         "List all accounts with their current balances from ACTUAL_DB_PATH. \
@@ -1066,6 +1073,111 @@ impl ActualServer {
         let api = self.budget_writes()?;
         let v = api
             .pin_balance(&account, balance_cents)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Spending totals from live REST (authoritative), not ACTUAL_DB_PATH. \
+            start_date and end_date are required YYYY-MM-DD. \
+            categories is an optional array of category names or ids. \
+            category_group is an optional category group name. If the server \
+            rejects or ignores category_group, the group is resolved with \
+            GET /api/v1/categories and filtered here. \
+            group_by is category (default), week, or day. Weeks are Monday-start \
+            ISO weeks of the stored America/Chicago dates. \
+            Transfers (rows with transfer_id) and income are excluded. \
+            Returns per-bucket and per-category totals in integer cents plus display, \
+            transaction counts, and a sync object from SimpleFIN status. \
+            Does not call SimpleFIN sync or claim."
+    )]
+    async fn live_spending(
+        &self,
+        start_date: String,
+        end_date: String,
+        categories: Option<Vec<String>>,
+        category_group: Option<String>,
+        group_by: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let categories = categories.unwrap_or_default();
+        let v = api
+            .live_spending(
+                &start_date,
+                &end_date,
+                &categories,
+                category_group.as_deref(),
+                group_by.as_deref(),
+            )
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "SimpleFIN link status from live REST (authoritative). \
+            GET /api/v1/simplefin/status and GET /api/v1/simplefin/links. \
+            Returns configured, cursor_epoch, and linked accounts with account name. \
+            last_sync_at, last_sync_attempt_at, and last_sync_error are included \
+            when the server sends them. Does not call POST /api/v1/simplefin/sync \
+            or POST /api/v1/simplefin/claim."
+    )]
+    async fn simplefin_status(&self) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api.simplefin_status().await.map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Predicted bills and paydays from live REST (authoritative). \
+            GET /api/v1/upcoming. \
+            days is an optional horizon from 1 to 365 (server default 60). \
+            lookback_months is optional history from 1 to 36 (server default 6). \
+            Amounts are ledger-signed integer cents. kind is income (payday) or expense (bill). \
+            Does not create or delete schedules."
+    )]
+    async fn upcoming(&self, days: Option<i64>, lookback_months: Option<i64>) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .upcoming(days, lookback_months)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Credit terms for one account from live REST (authoritative). \
+            GET /api/v1/accounts/{id}/credit-terms. \
+            account is id or name. \
+            Returns apr_bps and min_payment_cents when the account has terms."
+    )]
+    async fn get_credit_terms(&self, account: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .get_credit_terms(&account)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Write credit terms for one account via live REST (authoritative). \
+            This tool writes: PUT /api/v1/accounts/{id}/credit-terms. \
+            account is id or name. \
+            apr_bps is required, from 0 to 10000 (10000 = 100%). \
+            min_payment_cents is optional integer cents and must be >= 0. \
+            Omit min_payment_cents to store no minimum."
+    )]
+    async fn set_credit_terms(
+        &self,
+        account: String,
+        apr_bps: i64,
+        min_payment_cents: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .set_credit_terms(&account, apr_bps, min_payment_cents)
             .await
             .map_err(budget_api_error)?;
         json_result(&v)

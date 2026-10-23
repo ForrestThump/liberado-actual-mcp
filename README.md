@@ -30,6 +30,10 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `get_summary` | Coaching snapshot from Liberado Budget REST: on-budget cash, credit, loans, `next_target`, cashflow (`month`, `extra_cents`, `strategy`) |
 | `list_loans` | Registered loans (balances, APR bps, min payments) from Liberado Budget REST |
 | `loan_projection` | Avalanche/snowball payoff projection (`strategy`, `extra_cents`) |
+| `live_spending` | Spending totals from live REST (authoritative) for `start_date`..`end_date`. Optional `categories`, `category_group`, and `group_by` (`category` default, `week`, or `day`). Excludes transfers and income. Includes a SimpleFIN `sync` object |
+| `simplefin_status` | SimpleFIN link status from live REST (authoritative): configured, linked account names, `cursor_epoch`, and sync timestamps when the server sends them. Does not call sync or claim |
+| `upcoming` | Predicted bills and paydays from live REST (authoritative). Optional `days` (1..=365) and `lookback_months` (1..=36). `kind` is `income` or `expense` |
+| `get_credit_terms` | Credit terms for one account (id or name) from live REST (authoritative): `apr_bps` and `min_payment_cents` |
 | `balance_history` | Month-by-month running account balance |
 | `net_worth` | Total balance across all on-budget accounts |
 | `get_rules` | Auto-categorisation rules with parsed conditions and actions |
@@ -37,7 +41,11 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 
 ### Write tools
 
-Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly. Live API reads (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `get_summary`, `list_loans`, `loan_projection`, `budget_api_*`) use the same URL so they hit the running server, not a Syncthing mirror.
+Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Budget](https://github.com/ForrestThump/liberado-budget) server. They modify budget data via REST rather than writing to the SQLite file directly.
+
+Live REST tools (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `live_spending`, `simplefin_status`, `upcoming`, `get_summary`, `list_loans`, `loan_projection`, budget_api_*) are authoritative; ACTUAL_DB_PATH SQLite tools can lag; writes go through REST only.
+
+That sentence is the MCP server description (`initialize` → `serverInfo.description`). When `LIBERADO_BUDGET_API_KEY` is set, every REST request sends it as `X-API-Key`. The key is not logged. A 401 names that variable.
 
 | Tool | Description |
 |---|---|
@@ -57,12 +65,13 @@ Write tools require `LIBERADO_BUDGET_API_URL` pointing at a running [Liberado Bu
 | `import_csv` | Import a bank/card CSV (`account`, `format`, `csv` text or `inbox_file`) |
 | `create_transfer` | Linked transfer between two accounts (`amount_cents`) |
 | `pin_balance` | Back-adjust starting balance so ledger equals `balance_cents` |
+| `set_credit_terms` | Write credit terms via live REST (authoritative). `apr_bps` is 0..=10000. Optional `min_payment_cents` must be >= 0; omit it to store no minimum |
 
 Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
 
 ### Live reads vs the SQLite mirror
 
-`list_accounts`, `get_transactions`, and `get_budget_month` read `ACTUAL_DB_PATH`. That file is often a lagging Syncthing mirror: it can omit writes the live server already has, and it can still list accounts the live server has removed. Use `list_live_accounts`, `get_live_transactions`, and `get_live_budget_month` when the answer has to match the server that `set_budget_allocations` writes to.
+`list_accounts`, `get_transactions`, and `get_budget_month` read `ACTUAL_DB_PATH`. That file is often a lagging Syncthing mirror: it can omit writes the live server already has, and it can still list accounts the live server has removed. Live REST tools (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `live_spending`, `simplefin_status`, `upcoming`, `get_summary`, `list_loans`, `loan_projection`, budget_api_*) are authoritative; ACTUAL_DB_PATH SQLite tools can lag; writes go through REST only.
 
 `get_live_transactions` sends `start_date` and `end_date` on `GET /api/v1/transactions`. Liberado Budget applies those bounds in SQL (`t.date >= start AND t.date <= end`). This server does not download an unfiltered page and filter it locally.
 
@@ -108,6 +117,8 @@ Debt, coaching, and import tools also go through REST (`get_summary`,
 `list_loans`, and `loan_projection` are live API reads). Account balances,
 dated transactions, and the envelope month use `list_live_accounts`,
 `get_live_transactions`, and `get_live_budget_month`. Money is integer cents.
+
+`live_spending` totals a date range from `GET /api/v1/spending/by-category` or paged `GET /api/v1/transactions`. Weeks are Monday-start ISO weeks of the stored America/Chicago dates. Transfers and income are excluded, and the result includes a SimpleFIN `sync` object. `simplefin_status` reads `GET /api/v1/simplefin/status` and `GET /api/v1/simplefin/links` and does not call sync or claim. `upcoming` is `GET /api/v1/upcoming`. `get_credit_terms` reads, and `set_credit_terms` writes, `/api/v1/accounts/{id}/credit-terms`.
 
 `get_summary` is `GET /api/v1/summary` — the coaching snapshot agents should
 use instead of curling accounts + loans + ranking rules. Optional `month`
@@ -269,7 +280,8 @@ Or for a running HTTP server:
 | `ACTUAL_SERVER_URL` | Server mode | URL of your Actual Budget server |
 | `ACTUAL_PASSWORD` | Server mode | Server password |
 | `ACTUAL_BUDGET_ID` | Server mode | Budget sync ID (uses first if omitted) |
-| `LIBERADO_BUDGET_API_URL` | Write tools and live API reads (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `get_summary`, `list_loans`, …) | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
+| `LIBERADO_BUDGET_API_URL` | Write tools and live REST reads | Base URL of Liberado Budget REST API (e.g. `http://127.0.0.1:8675`) |
+| `LIBERADO_BUDGET_API_KEY` | No | When set, sent as `X-API-Key` on every Liberado Budget REST request. Not logged. A 401 says to check this variable |
 | `BIND_ADDR` | No | Enables HTTP transport on this address; binary defaults to STDIO when unset (Docker image sets `0.0.0.0:8000`) |
 
 ---
