@@ -153,6 +153,10 @@ impl BudgetApi {
         self.send(reqwest::Method::PUT, path, Some(body)).await
     }
 
+    pub async fn delete(&self, path: &str) -> Result<Value, String> {
+        self.send(reqwest::Method::DELETE, path, None).await
+    }
+
     pub async fn create_category(
         &self,
         name: &str,
@@ -364,6 +368,59 @@ impl BudgetApi {
             body["limit"] = json!(l);
         }
         self.post("/api/v1/rules/apply", &body).await
+    }
+
+    /// Change one rule. `category` is an id or name, resolved like
+    /// [`Self::create_payee_rule`]. Omitted patterns and category are left as
+    /// stored. A category action written here uses `"op":"set"`.
+    pub async fn update_rule(
+        &self,
+        id: &str,
+        payee_regex: Option<&str>,
+        notes_regex: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<Value, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("rule id is required".into());
+        }
+        let payee_regex = trimmed_opt(payee_regex);
+        let notes_regex = trimmed_opt(notes_regex);
+        let category = trimmed_opt(category);
+        if payee_regex.is_none() && notes_regex.is_none() && category.is_none() {
+            return Err(
+                "update_rule requires at least one of payee_regex, notes_regex, or category".into(),
+            );
+        }
+        let category_id = match category {
+            Some(name) => Some(self.resolve_category(name).await?),
+            None => None,
+        };
+        let listed = self.get("/api/v1/rules").await?;
+        let rule = find_rule(&listed, id).ok_or_else(|| format!("rule '{id}' not found"))?;
+        let body = rule_update_body(&rule, payee_regex, notes_regex, category_id.as_deref())?;
+        let mut updated = self.put(&rule_item_path(id)?, &body).await?;
+        if let Some(obj) = updated.as_object_mut() {
+            if let Some(cid) = &category_id {
+                obj.insert("category_id".to_string(), json!(cid));
+            }
+            if let Some(pattern) = payee_regex {
+                obj.insert("payee_regex".to_string(), json!(pattern));
+            }
+            if let Some(pattern) = notes_regex {
+                obj.insert("notes_regex".to_string(), json!(pattern));
+            }
+        }
+        Ok(updated)
+    }
+
+    /// `DELETE /api/v1/rules/{id}`. The API's 400/404 body is returned as the error text.
+    pub async fn delete_rule(&self, id: &str) -> Result<Value, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("rule id is required".into());
+        }
+        self.delete(&rule_item_path(id)?).await
     }
 
     pub async fn set_budget_amount(
@@ -865,20 +922,160 @@ pub fn parse_allocation_items(items: &[Value]) -> Result<Vec<(String, i64)>, Str
     Ok(out)
 }
 
+/// `POST /api/v1/rules` body. Category actions include `"op":"set"`, the shape
+/// liberado-budget stores (`rule_body` in its `ui/src/api.rs`, and `domain::rules` tests).
 pub fn payee_rule_body(payee_regex: &str, category_id: &str) -> Value {
     json!({
         "stage": "pre",
         "conditions_op": "and",
-        "conditions": [{
-            "field": "payee",
-            "op": "regex",
-            "value": payee_regex,
-        }],
-        "actions": [{
-            "field": "category",
-            "value": category_id,
-        }],
+        "conditions": [regex_condition("payee", payee_regex)],
+        "actions": [category_set_action(category_id)],
     })
+}
+
+fn category_set_action(category_id: &str) -> Value {
+    json!({
+        "field": "category",
+        "op": "set",
+        "value": category_id,
+    })
+}
+
+fn regex_condition(field: &str, pattern: &str) -> Value {
+    json!({
+        "field": field,
+        "op": "regex",
+        "value": pattern,
+    })
+}
+
+fn trimmed_opt(value: Option<&str>) -> Option<&str> {
+    match value.map(str::trim) {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    }
+}
+
+fn rule_item_path(id: &str) -> Result<String, String> {
+    if id.contains('/') || id.contains('\\') {
+        return Err("rule id must be a single id, not a path".into());
+    }
+    Ok(format!("/api/v1/rules/{}", encode_query(id)))
+}
+
+fn find_rule(doc: &Value, id: &str) -> Option<Value> {
+    array_field(doc, "rules")
+        .into_iter()
+        .find(|rule| rule.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+/// PUT body for [`BudgetApi::update_rule`]. Patterns replace the matching
+/// condition (or append one). A provided category id replaces the category
+/// action. Category actions this writes always include `"op":"set"`. An
+/// existing category action that is missing that op is normalized even when
+/// the category itself is unchanged.
+pub fn rule_update_body(
+    rule: &Value,
+    payee_regex: Option<&str>,
+    notes_regex: Option<&str>,
+    category_id: Option<&str>,
+) -> Result<Value, String> {
+    let payee_regex = trimmed_opt(payee_regex);
+    let notes_regex = trimmed_opt(notes_regex);
+    let category_id = trimmed_opt(category_id);
+    if payee_regex.is_none() && notes_regex.is_none() && category_id.is_none() {
+        return Err(
+            "update_rule requires at least one of payee_regex, notes_regex, or category".into(),
+        );
+    }
+    let mut body = json!({});
+    if payee_regex.is_some() || notes_regex.is_some() {
+        let mut conditions = array_field(rule, "conditions");
+        if let Some(pattern) = payee_regex {
+            upsert_condition(&mut conditions, "payee", pattern, is_payee_pattern_field);
+        }
+        if let Some(pattern) = notes_regex {
+            upsert_condition(&mut conditions, "notes", pattern, |field| {
+                field.eq_ignore_ascii_case("notes")
+            });
+        }
+        body["conditions"] = json!(conditions);
+    }
+    let mut actions = array_field(rule, "actions");
+    if category_id.is_some() || category_actions_need_set_op(&actions) {
+        if let Some(id) = category_id {
+            upsert_category_action(&mut actions, id);
+        }
+        normalize_category_actions(&mut actions);
+        body["actions"] = json!(actions);
+    }
+    Ok(body)
+}
+
+fn is_payee_pattern_field(field: &str) -> bool {
+    const FIELDS: &[&str] = &[
+        "payee",
+        "payee_name",
+        "imported_payee",
+        "merchant",
+        "description",
+        "any",
+    ];
+    FIELDS.iter().any(|name| field.eq_ignore_ascii_case(name))
+}
+
+fn upsert_condition(
+    conditions: &mut Vec<Value>,
+    field: &str,
+    pattern: &str,
+    matches_field: impl Fn(&str) -> bool,
+) {
+    let condition = regex_condition(field, pattern);
+    if let Some(existing) = conditions
+        .iter_mut()
+        .find(|c| condition_field_is(c, &matches_field))
+    {
+        *existing = condition;
+    } else {
+        conditions.push(condition);
+    }
+}
+
+fn condition_field_is(value: &Value, matches_field: impl Fn(&str) -> bool) -> bool {
+    value
+        .get("field")
+        .and_then(|v| v.as_str())
+        .is_some_and(matches_field)
+}
+
+fn upsert_category_action(actions: &mut Vec<Value>, category_id: &str) {
+    let action = category_set_action(category_id);
+    if let Some(existing) = actions
+        .iter_mut()
+        .find(|a| a.get("field").and_then(|v| v.as_str()) == Some("category"))
+    {
+        *existing = action;
+    } else {
+        actions.push(action);
+    }
+}
+
+fn category_actions_need_set_op(actions: &[Value]) -> bool {
+    actions.iter().any(|action| {
+        action.get("field").and_then(|v| v.as_str()) == Some("category")
+            && action.get("op").and_then(|v| v.as_str()) != Some("set")
+    })
+}
+
+fn normalize_category_actions(actions: &mut [Value]) {
+    for action in actions.iter_mut() {
+        if action.get("field").and_then(|v| v.as_str()) == Some("category")
+            && action.get("op").and_then(|v| v.as_str()) != Some("set")
+        {
+            let value = action.get("value").cloned().unwrap_or(Value::Null);
+            *action = json!({"field": "category", "op": "set", "value": value});
+        }
+    }
 }
 
 pub fn resolve_category_id(doc: &Value, name_or_id: &str) -> Option<String> {
@@ -2084,8 +2281,98 @@ mod tests {
         let b = payee_rule_body("FRYS", "c-groc");
         assert_eq!(b["conditions_op"], "and");
         assert_eq!(b["conditions"][0]["op"], "regex");
+        assert_eq!(b["conditions"][0]["field"], "payee");
+        assert_eq!(b["conditions"][0]["value"], "FRYS");
         assert_eq!(b["actions"][0]["field"], "category");
+        assert_eq!(b["actions"][0]["op"], "set");
         assert_eq!(b["actions"][0]["value"], "c-groc");
+    }
+
+    fn refunds_rule() -> Value {
+        json!({
+            "id": "r-refund",
+            "conditions": [
+                {"field": "payee", "op": "regex", "value": "DEBIT RETURN|CHECK DEPOSIT"},
+                {"field": "account", "op": "contains", "value": "Checking"}
+            ],
+            "actions": [
+                {"field": "category", "value": "c-old"},
+                {"field": "cleared", "op": "set", "value": true}
+            ]
+        })
+    }
+
+    #[test]
+    fn rule_update_retargets_payee_and_category_and_keeps_siblings() {
+        let body =
+            rule_update_body(&refunds_rule(), Some("ACH RETURN"), None, Some("c-refunds")).unwrap();
+        assert_eq!(body["conditions"][0]["field"], "payee");
+        assert_eq!(body["conditions"][0]["op"], "regex");
+        assert_eq!(body["conditions"][0]["value"], "ACH RETURN");
+        assert_eq!(body["conditions"][1]["field"], "account");
+        assert_eq!(body["conditions"][1]["value"], "Checking");
+        assert_eq!(body["actions"][0]["field"], "category");
+        assert_eq!(body["actions"][0]["op"], "set");
+        assert_eq!(body["actions"][0]["value"], "c-refunds");
+        assert_eq!(body["actions"][1]["field"], "cleared");
+        assert_eq!(body["actions"][1]["value"], true);
+    }
+
+    #[test]
+    fn rule_update_category_only_leaves_conditions_out() {
+        let body = rule_update_body(&refunds_rule(), None, None, Some("c-refunds")).unwrap();
+        assert!(body.get("conditions").is_none());
+        assert_eq!(body["actions"][0]["op"], "set");
+        assert_eq!(body["actions"][0]["value"], "c-refunds");
+        assert_eq!(body["actions"][1]["field"], "cleared");
+    }
+
+    #[test]
+    fn rule_update_adds_notes_pattern() {
+        let body = rule_update_body(&refunds_rule(), None, Some("issuer: Refunds"), None).unwrap();
+        assert_eq!(body["conditions"][0]["value"], "DEBIT RETURN|CHECK DEPOSIT");
+        assert_eq!(body["conditions"][2]["field"], "notes");
+        assert_eq!(body["conditions"][2]["op"], "regex");
+        assert_eq!(body["conditions"][2]["value"], "issuer: Refunds");
+        // The stored category action had no op; an update rewrites it to the canonical shape.
+        assert_eq!(body["actions"][0]["op"], "set");
+        assert_eq!(body["actions"][0]["value"], "c-old");
+    }
+
+    #[test]
+    fn rule_update_pattern_keeps_canonical_actions_untouched() {
+        let rule = json!({
+            "id": "r1",
+            "conditions": [{"field": "payee", "op": "regex", "value": "OLD"}],
+            "actions": [{"field": "category", "op": "set", "value": "c-old"}]
+        });
+        let body = rule_update_body(&rule, Some("NEW"), None, None).unwrap();
+        assert_eq!(body["conditions"][0]["value"], "NEW");
+        assert!(body.get("actions").is_none());
+    }
+
+    #[test]
+    fn rule_update_replaces_payee_name_condition() {
+        let rule = json!({
+            "id": "r1",
+            "conditions": [
+                {"field": "payee_name", "op": "matches", "value": "OLD"},
+                {"field": "notes", "op": "regex", "value": "keep"}
+            ],
+            "actions": [{"field": "category", "op": "set", "value": "c-old"}]
+        });
+        let body = rule_update_body(&rule, Some("NEW"), None, None).unwrap();
+        assert_eq!(body["conditions"][0]["field"], "payee");
+        assert_eq!(body["conditions"][0]["op"], "regex");
+        assert_eq!(body["conditions"][0]["value"], "NEW");
+        assert_eq!(body["conditions"][1]["field"], "notes");
+        assert_eq!(body["conditions"][1]["value"], "keep");
+    }
+
+    #[test]
+    fn rule_update_requires_a_change() {
+        let err = rule_update_body(&refunds_rule(), Some("  "), None, None).unwrap_err();
+        assert!(err.contains("payee_regex"), "{err}");
     }
 
     #[test]
@@ -2169,6 +2456,240 @@ mod tests {
         assert_eq!(v["created"], false);
         assert_eq!(v["id"], "r-exist");
         h.join().unwrap();
+    }
+
+    fn http_json_body(req: &str) -> Value {
+        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+        serde_json::from_str(body.trim_end_matches('\0'))
+            .unwrap_or_else(|e| panic!("body JSON ({e}) in {req}"))
+    }
+
+    fn groceries_categories() -> String {
+        json!({
+            "category_groups": [{
+                "categories": [
+                    {"id": "c-groc", "name": "Groceries"},
+                    {"id": "c-refunds", "name": "Refunds"}
+                ]
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn create_payee_rule_posts_canonical_set_action() {
+        let (base, h, rx) = spawn_request_mock(vec![
+            ("GET /api/v1/categories".into(), 200, groceries_categories()),
+            (
+                "GET /api/v1/rules HTTP".into(),
+                200,
+                json!({"rules": []}).to_string(),
+            ),
+            (
+                "POST /api/v1/rules".into(),
+                201,
+                json!({"id": "r-new", "matched": 1}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.create_payee_rule("FRYS", "Groceries").await.unwrap();
+        assert_eq!(v["created"], true);
+        let _ = rx.recv().unwrap();
+        let _ = rx.recv().unwrap();
+        let post = rx.recv().unwrap();
+        assert!(post.starts_with("POST "), "{post}");
+        let body = http_json_body(&post);
+        assert_eq!(body["actions"][0]["field"], "category");
+        assert_eq!(body["actions"][0]["op"], "set");
+        assert_eq!(body["actions"][0]["value"], "c-groc");
+        assert_eq!(body["conditions"][0]["op"], "regex");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_rule_resolves_category_name_and_puts_canonical_action() {
+        let existing = json!({
+            "rules": [{
+                "id": "r-refund",
+                "conditions": [
+                    {"field": "payee", "op": "regex", "value": "DEBIT RETURN|CHECK DEPOSIT"}
+                ],
+                "actions": [{"field": "category", "value": "c-groc"}]
+            }]
+        });
+        let (base, h, rx) = spawn_request_mock(vec![
+            ("GET /api/v1/categories".into(), 200, groceries_categories()),
+            ("GET /api/v1/rules HTTP".into(), 200, existing.to_string()),
+            (
+                "PUT /api/v1/rules/r-refund".into(),
+                200,
+                json!({"updated": "r-refund", "matched": 4}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .update_rule(
+                "r-refund",
+                Some("ACH RETURN|CHECK DEPOSIT"),
+                None,
+                Some("Refunds"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["updated"], "r-refund");
+        assert_eq!(v["matched"], 4);
+        assert_eq!(v["category_id"], "c-refunds");
+        assert_eq!(v["payee_regex"], "ACH RETURN|CHECK DEPOSIT");
+        let _ = rx.recv().unwrap();
+        let _ = rx.recv().unwrap();
+        let put = rx.recv().unwrap();
+        assert!(put.starts_with("PUT "), "{put}");
+        let body = http_json_body(&put);
+        assert_eq!(body["conditions"][0]["op"], "regex");
+        assert_eq!(body["conditions"][0]["value"], "ACH RETURN|CHECK DEPOSIT");
+        assert_eq!(body["actions"][0]["field"], "category");
+        assert_eq!(body["actions"][0]["op"], "set");
+        assert_eq!(body["actions"][0]["value"], "c-refunds");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_rule_accepts_category_id() {
+        let existing = json!({
+            "rules": [{
+                "id": "r-refund",
+                "conditions": [{"field": "payee", "op": "regex", "value": "FRYS"}],
+                "actions": [{"field": "category", "op": "set", "value": "c-groc"}]
+            }]
+        });
+        let (base, h, rx) = spawn_request_mock(vec![
+            ("GET /api/v1/categories".into(), 200, groceries_categories()),
+            ("GET /api/v1/rules HTTP".into(), 200, existing.to_string()),
+            (
+                "PUT /api/v1/rules/r-refund".into(),
+                200,
+                json!({"updated": "r-refund", "matched": 0}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .update_rule(" r-refund ", None, None, Some("c-refunds"))
+            .await
+            .unwrap();
+        assert_eq!(v["category_id"], "c-refunds");
+        let _ = rx.recv().unwrap();
+        let _ = rx.recv().unwrap();
+        let body = http_json_body(&rx.recv().unwrap());
+        assert!(body.get("conditions").is_none(), "{body}");
+        assert_eq!(body["actions"][0]["op"], "set");
+        assert_eq!(body["actions"][0]["value"], "c-refunds");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_rule_missing_and_empty_are_errors() {
+        let (base, h) = spawn_json_mock(vec![(
+            "GET /api/v1/rules HTTP".into(),
+            200,
+            json!({"rules": []}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let missing = api
+            .update_rule("r-nope", Some("FRYS"), None, None)
+            .await
+            .unwrap_err();
+        assert!(missing.contains("rule 'r-nope' not found"), "{missing}");
+        assert!(!missing.contains("request failed"), "{missing}");
+        h.join().unwrap();
+
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let empty = api
+            .update_rule("r1", None, Some("  "), None)
+            .await
+            .unwrap_err();
+        assert!(empty.contains("payee_regex"), "{empty}");
+        assert!(!empty.contains("request failed"), "{empty}");
+        let no_id = api
+            .update_rule("  ", Some("FRYS"), None, None)
+            .await
+            .unwrap_err();
+        assert!(no_id.contains("rule id is required"), "{no_id}");
+    }
+
+    #[tokio::test]
+    async fn update_rule_surfaces_api_400_and_404() {
+        let existing = json!({
+            "rules": [{
+                "id": "r1",
+                "conditions": [{"field": "payee", "op": "regex", "value": "FRYS"}],
+                "actions": [{"field": "category", "op": "set", "value": "c-groc"}]
+            }]
+        });
+        let (base, h) = spawn_json_mock(vec![
+            ("GET /api/v1/rules HTTP".into(), 200, existing.to_string()),
+            (
+                "PUT /api/v1/rules/r1".into(),
+                400,
+                json!({"error": "invalid regex: missing )"}).to_string(),
+            ),
+            ("GET /api/v1/rules HTTP".into(), 200, existing.to_string()),
+            (
+                "PUT /api/v1/rules/r1".into(),
+                404,
+                json!({"error": "rule r1 not found"}).to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let bad = api
+            .update_rule("r1", Some("(unclosed"), None, None)
+            .await
+            .unwrap_err();
+        assert!(is_budget_status(&bad, 400), "{bad}");
+        assert!(bad.contains("invalid regex"), "{bad}");
+        let missing = api
+            .update_rule("r1", Some("FRYS"), None, None)
+            .await
+            .unwrap_err();
+        assert!(is_budget_status(&missing, 404), "{missing}");
+        assert!(missing.contains("not found"), "{missing}");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_rule_sends_delete() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "DELETE /api/v1/rules/r-refund".into(),
+            200,
+            json!({"deleted": "r-refund"}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.delete_rule(" r-refund ").await.unwrap();
+        assert_eq!(v["deleted"], "r-refund");
+        let req = rx.recv().unwrap();
+        assert!(req.starts_with("DELETE /api/v1/rules/r-refund"), "{req}");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_rule_surfaces_404_and_rejects_bad_id() {
+        let (base, h) = spawn_json_mock(vec![(
+            "DELETE /api/v1/rules/r-missing".into(),
+            404,
+            json!({"error": "rule r-missing not found"}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let err = api.delete_rule("r-missing").await.unwrap_err();
+        assert!(is_budget_status(&err, 404), "{err}");
+        assert!(err.contains("rule r-missing not found"), "{err}");
+        h.join().unwrap();
+
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let empty = api.delete_rule("  ").await.unwrap_err();
+        assert!(empty.contains("rule id is required"), "{empty}");
+        assert!(!empty.contains("request failed"), "{empty}");
+        let path = api.delete_rule("a/b").await.unwrap_err();
+        assert!(path.contains("not a path"), "{path}");
+        assert!(!path.contains("request failed"), "{path}");
     }
 
     #[test]

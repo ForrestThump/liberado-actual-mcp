@@ -529,7 +529,10 @@ impl ActualServer {
         "List all transaction auto-categorisation rules. \
             Each rule has conditions (criteria to match transactions) and actions \
             (fields to set when matched). conditions and actions are JSON arrays. \
-            stage is 'pre', 'post', or null (default/main execution order)."
+            stage is 'pre', 'post', or null (default/main execution order). \
+            To change a rule's payee pattern, notes pattern, or category, call \
+            update_rule with this id. To remove a rule, call delete_rule. \
+            Do not create a second rule when one already matches."
     )]
     async fn get_rules(&self) -> McpResult<String> {
         json_result(&self.query(db::get_rules).await?)
@@ -807,22 +810,74 @@ impl ActualServer {
     }
 
     #[tool(
-        "Create a rule: payee matches this regex (plain text = case-insensitive substring) \
-            → set category (id or name). Auto-applies to uncategorized transactions; \
-            response includes matched count. Idempotent: does not duplicate an equivalent rule."
+        "Create a new rule: payee matches this regex (plain text = case-insensitive substring) \
+            → set category (id or name). To change an existing rule, call update_rule with \
+            its id from get_rules — do not create a second rule to retarget one. \
+            Auto-applies to uncategorized transactions; response includes matched count. \
+            Idempotent: does not duplicate an equivalent rule."
     )]
     async fn create_payee_rule(&self, payee_regex: String, category: String) -> McpResult<String> {
         let api = self.budget_writes()?;
         let v = api
             .create_payee_rule(&payee_regex, &category)
             .await
-            .map_err(McpError::internal)?;
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Change an existing auto-categorisation rule by id from get_rules. \
+            Use this to retarget a rule (for example DEBIT RETURN|CHECK DEPOSIT → Refunds) \
+            instead of creating another one with create_payee_rule. \
+            Pass only the fields to change; omitted fields stay as they are. \
+            payee_regex replaces the rule's payee/merchant pattern. \
+            notes_regex replaces or adds a notes pattern. \
+            Plain text matches as a case-insensitive substring; metacharacters are regex. \
+            category is an id or name (same resolution as create_payee_rule) and becomes \
+            the category the rule sets. \
+            The budget API re-applies rules to uncategorized transactions and the \
+            response includes matched. \
+            Unknown id, unknown category, and API rejections (400 invalid regex, 404) \
+            are tool errors. This does not create or delete a rule."
+    )]
+    async fn update_rule(
+        &self,
+        rule_id: String,
+        payee_regex: Option<String>,
+        notes_regex: Option<String>,
+        category: Option<String>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .update_rule(
+                &rule_id,
+                payee_regex.as_deref(),
+                notes_regex.as_deref(),
+                category.as_deref(),
+            )
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Delete one auto-categorisation rule by id from get_rules. \
+            To change a payee pattern, notes pattern, or category, call update_rule \
+            instead of deleting and recreating. \
+            Deleting does not recategorize transactions that already have a category. \
+            Unknown ids and API errors (404, 400) are tool errors."
+    )]
+    async fn delete_rule(&self, rule_id: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api.delete_rule(&rule_id).await.map_err(budget_api_error)?;
         json_result(&v)
     }
 
     #[tool(
         "Apply auto-categorisation rules to transactions with no category or the \
-            reserved Uncategorized category. Returns matched count."
+            reserved Uncategorized category. Returns matched count. \
+            update_rule and create_payee_rule already re-apply on write; call this \
+            to re-run every rule without editing one."
     )]
     async fn apply_rules(
         &self,

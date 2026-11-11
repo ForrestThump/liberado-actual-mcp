@@ -36,7 +36,7 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `get_credit_terms` | Credit terms for one account (id or name) from live REST (authoritative): `apr_bps` and `min_payment_cents` |
 | `balance_history` | Month-by-month running account balance |
 | `net_worth` | Total balance across all on-budget accounts |
-| `get_rules` | Auto-categorisation rules with parsed conditions and actions |
+| `get_rules` | Auto-categorisation rules with parsed conditions and actions. Edit one with `update_rule`; remove one with `delete_rule` |
 | `refresh` | Re-download latest budget data from server (server mode only) |
 
 ### Write tools
@@ -56,7 +56,9 @@ That sentence is the MCP server description (`initialize` → `serverInfo.descri
 | `set_transaction_category` | Set one transaction's category |
 | `set_transaction_payee` | Set one transaction's payee |
 | `categorize_transactions` | Bulk-assign category; optional learn-from-payees |
-| `create_payee_rule` | Create a payee-regex auto-categorisation rule |
+| `create_payee_rule` | Create a payee-regex auto-categorisation rule. To change an existing rule, use `update_rule` |
+| `update_rule` | Change one rule by id: optional new payee pattern, notes pattern, and/or category (id or name). Omitted fields stay |
+| `delete_rule` | Delete one rule by id. Does not recategorize transactions already assigned |
 | `apply_rules` | Re-run rules on uncategorized transactions |
 | `set_budget_amount` | Set one category's monthly envelope allocation (`month`, `category` id or name, `amount_cents`) |
 | `set_budget_allocations` | Set many allocations for a month (`[{category, amount_cents}, ...]`) |
@@ -68,6 +70,8 @@ That sentence is the MCP server description (`initialize` → `serverInfo.descri
 | `set_credit_terms` | Write credit terms via live REST (authoritative). `apr_bps` is 0..=10000. Optional `min_payment_cents` must be >= 0; omit it to store no minimum |
 
 Rules use `regex` by default (plain text matches as case-insensitive substring). Imports with no matching rule are assigned to the reserved **Uncategorized** category.
+
+`update_rule` edits one rule by id from `get_rules`. Pass only what should change: `payee_regex`, `notes_regex`, and `category` (id or name, resolved the same way as `create_payee_rule`). `delete_rule` removes a rule by id. Category actions written by `create_payee_rule` and `update_rule` are `{"field":"category","op":"set","value":"<category id>"}`. A 400 (for example an invalid regex) or 404 from the budget API is returned as a tool error.
 
 ### Live reads vs the SQLite mirror
 
