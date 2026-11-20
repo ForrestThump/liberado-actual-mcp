@@ -340,7 +340,10 @@ impl ActualServer {
             account is id or name (omit for all accounts). \
             category is id or name. payee and notes are partial, case-insensitive. \
             limit defaults to 500 (max 2000). \
-            min_amount_cents and max_amount_cents are inclusive integer cents."
+            min_amount_cents and max_amount_cents are inclusive integer cents. \
+            This is one account or one category. For totals across many categories \
+            use live_spending. For the rows across many categories use \
+            budget_api_transactions_by_category (category_regex is a regex)."
     )]
     // Same filter set as get_transactions; the REST call applies each one.
     #[allow(clippy::too_many_arguments)]
@@ -379,9 +382,48 @@ impl ActualServer {
         json_result(&self.query(db::list_categories).await?)
     }
 
-    #[tool("List all payees")]
-    async fn list_payees(&self) -> McpResult<String> {
-        json_result(&self.query(db::list_payees).await?)
+    #[tool(
+        "Look up payees by name. search is a case-insensitive substring; prefix \
+            matches the start of the name. compact=true returns id and name only \
+            and is sent as compact=1. limit defaults to 100 (max 1000); offset \
+            pages the matches. exclude_empty defaults to true (sent as \
+            exclude_empty=1) and drops empty-name transfer payees; pass false to \
+            keep them. The result is {payees, total, returned, offset, limit, \
+            truncated, omitted_empty, compact, exclude_empty, applied}. applied \
+            is \"server\" when the budget API already paged the matches and \
+            \"client\" when this server filtered the full list. Pass search or \
+            prefix instead of paging the whole directory. Uses Liberado Budget \
+            REST when LIBERADO_BUDGET_API_URL is set and forwards search, prefix, \
+            limit, offset, compact, and exclude_empty on GET /api/v1/payees. If \
+            that server ignores the parameters or returns 400, the same filters \
+            run here. Otherwise reads ACTUAL_DB_PATH. Does not merge payees. A \
+            rename keeps the payee id; a second payee id is a second schedule."
+    )]
+    async fn list_payees(
+        &self,
+        search: Option<String>,
+        prefix: Option<String>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        compact: Option<bool>,
+        exclude_empty: Option<bool>,
+    ) -> McpResult<String> {
+        let query = crate::payees::PayeeQuery::from_args(
+            search.as_deref(),
+            prefix.as_deref(),
+            limit,
+            offset,
+            compact,
+            exclude_empty,
+        )
+        .map_err(McpError::invalid_params)?;
+        if let Some(api) = self.state.budget_api.as_ref() {
+            let page = api.list_payees(&query).await.map_err(budget_api_error)?;
+            return json_result(&page);
+        }
+        let payees = self.query(db::list_payees).await?;
+        let doc = serde_json::json!({ "payees": payees });
+        json_result(&crate::payees::project_payees(&doc, &query))
     }
 
     #[tool(
@@ -683,9 +725,12 @@ impl ActualServer {
     }
 
     #[tool(
-        "Return transactions whose category name matches category_regex from the \
-            Liberado Budget REST API (requires LIBERADO_BUDGET_API_URL). \
-            Plain text matches as case-insensitive substring."
+        "Rows for many categories in one call from Liberado Budget REST \
+            (requires LIBERADO_BUDGET_API_URL). category_regex is a regex, so \
+            ^(Rent|Groceries|Utilities)$ returns those categories together. \
+            Plain text with no regex metacharacters matches as a case-insensitive \
+            substring. Use this instead of get_live_transactions once per category \
+            when you need the transactions. For totals, use live_spending."
     )]
     async fn budget_api_transactions_by_category(
         &self,
@@ -749,7 +794,13 @@ impl ActualServer {
         json_result(&serde_json::json!({ "id": id, "name": name }))
     }
 
-    #[tool("Rename a payee by id or current name. Transactions keep the same payee id.")]
+    #[tool(
+        "Rename a payee by id or current name. The payee id stays the same, so that \
+            payee's bill schedule stays put. A different payee id with a similar \
+            name still has its own schedule. This tool does not merge payees. Hide \
+            a leftover schedule with dismiss_schedule_override. Let detection \
+            return with clear_schedule_override."
+    )]
     async fn rename_payee(&self, payee: String, new_name: String) -> McpResult<String> {
         let api = self.budget_writes()?;
         let id = api
@@ -1134,9 +1185,11 @@ impl ActualServer {
     }
 
     #[tool(
-        "Spending totals from live REST (authoritative), not ACTUAL_DB_PATH. \
-            start_date and end_date are required YYYY-MM-DD. \
-            categories is an optional array of category names or ids. \
+        "Spending totals for many categories in one call, from live REST \
+            (authoritative), not ACTUAL_DB_PATH. Omit categories to cover every \
+            category, or pass a categories array of names or ids. Use this instead \
+            of get_live_transactions once per category. Each category row includes \
+            its group name. start_date and end_date are required YYYY-MM-DD. \
             category_group is an optional category group name. If the server \
             rejects or ignores category_group, the group is resolved with \
             GET /api/v1/categories and filtered here. \
@@ -1185,17 +1238,107 @@ impl ActualServer {
     }
 
     #[tool(
-        "Predicted bills and paydays from live REST (authoritative). \
+        "Predicted bills and paydays from live REST (authoritative). Call it once. \
             GET /api/v1/upcoming. \
             days is an optional horizon from 1 to 365 (server default 60). \
             lookback_months is optional history from 1 to 36 (server default 6). \
-            Amounts are ledger-signed integer cents. kind is income (payday) or expense (bill). \
-            Does not create or delete schedules."
+            expand=true sends expand=1 and asks for every occurrence in \
+            [today, today+days], including the day at the end of the horizon. \
+            Pass days far enough to cover the dates you need (February rent is \
+            not in a 60-day window that starts in late November). Each occurrence \
+            reuses the schedule mean. The row id is schedule_id, '#', and the date. \
+            schedule_id is what dismiss_schedule_override and \
+            clear_schedule_override take. Omit expand for one next date per \
+            schedule. If this server cannot expand, expanded is false and \
+            expand_note says to infer later dates from cadence and interval_days \
+            and to say they were inferred. \
+            Amounts are ledger-signed integer cents. kind is income (payday) or \
+            expense (bill). \
+            source is detected (inferred this request and not stored; confidence \
+            is 0 to 1; the id is payee_id:category_id, plus :dN for a second \
+            monthly day), override (a saved upcoming_schedules row replaced the \
+            detection; confidence 1), or manual (saved with manual true and the \
+            id matched no detection; confidence 1). source=override is not itself \
+            a duplicate. confidence is not a duplicate flag. \
+            Schedules key on payee_id. Renaming a payee keeps that id. A second \
+            payee id is a second schedule. \
+            stale, possible_duplicate_of, and duplicate_reason come from the \
+            budget API when it sends them (along with duplicate_rule and \
+            source_legend). Trust those and do not re-derive them. Otherwise the \
+            same rule is applied here: stale is true and possible_duplicate_of \
+            names the other schedule only when that schedule shares the category, \
+            the amounts are within 15% of the larger, and its last_date is newer \
+            by more than this schedule's interval_days. A late bill with no such \
+            sibling stays stale false. Two schedules on the same payee are not \
+            duplicates. schedule_warnings lists the pairs. \
+            Hide a saved schedule with dismiss_schedule_override (detection stays \
+            suppressed). Tombstone one so detection can return with \
+            clear_schedule_override. This tool does not create a schedule."
     )]
-    async fn upcoming(&self, days: Option<i64>, lookback_months: Option<i64>) -> McpResult<String> {
+    async fn upcoming(
+        &self,
+        days: Option<i64>,
+        lookback_months: Option<i64>,
+        expand: Option<bool>,
+    ) -> McpResult<String> {
         let api = self.budget_writes()?;
         let v = api
-            .upcoming(days, lookback_months)
+            .upcoming(days, lookback_months, expand)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "List saved upcoming schedule overrides from live REST. \
+            GET /api/v1/upcoming/schedules. \
+            Returns every saved row that is not tombstoned, including hidden \
+            dismissals. On a stored row, source is manual when manual is true and \
+            override otherwise. hidden is separate from source. Pure detections \
+            are not listed. Requires the budget API from \
+            ForrestThump/liberado-budget#44. Does not create a schedule."
+    )]
+    async fn list_schedule_overrides(&self) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .list_schedule_overrides()
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Hide a saved upcoming schedule. \
+            DELETE /api/v1/upcoming/schedules/{schedule_id}. \
+            Pass schedule_id from upcoming or list_schedule_overrides, not an \
+            expanded occurrence id (those contain # and a date). Hiding keeps \
+            the row, so detection cannot bring the bill back. Returns \
+            {deleted, hidden: true}. deleted is the dismissed schedule id. \
+            Requires the budget API from ForrestThump/liberado-budget#44. \
+            To let detection return, use clear_schedule_override."
+    )]
+    async fn dismiss_schedule_override(&self, schedule_id: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .dismiss_schedule_override(&schedule_id)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Tombstone a saved upcoming schedule so detection can return. \
+            POST /api/v1/upcoming/schedules/{schedule_id}/clear. \
+            Pass schedule_id, not an expanded occurrence id (those contain # and \
+            a date). An override stops replacing detection, and a dismissal stops \
+            suppressing the bill. Idempotent. Returns {cleared, removed}. removed \
+            is false when no live row existed. Requires the budget API from \
+            ForrestThump/liberado-budget#44."
+    )]
+    async fn clear_schedule_override(&self, schedule_id: String) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .clear_schedule_override(&schedule_id)
             .await
             .map_err(budget_api_error)?;
         json_result(&v)

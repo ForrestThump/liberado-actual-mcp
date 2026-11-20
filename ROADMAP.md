@@ -6,7 +6,7 @@
 - `list_accounts` — all accounts with current balance
 - `get_transactions` — transaction history; filters: account, date range, amount range, category, payee (partial), notes (partial)
 - `list_categories` — category groups and categories
-- `list_payees` — all payees
+- `list_payees` — search, prefix, compact, and a bounded page
 - `get_budget_month` — budgeted vs. actual by category for a month
 - `monthly_summary` — income, expenses, net per month over a range
 - `spending_by_category` — expense totals by category over a date range
