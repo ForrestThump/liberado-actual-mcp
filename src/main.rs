@@ -3,7 +3,9 @@ mod budget_api;
 mod db;
 mod models;
 mod pattern;
+mod payees;
 mod server;
+mod upcoming_flags;
 
 use server::ActualServer;
 use turbomcp::prelude::*;

@@ -15,9 +15,9 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `list_accounts` | All accounts with current balances from `ACTUAL_DB_PATH` (may lag) |
 | `list_live_accounts` | Live account balances from Liberado Budget REST |
 | `get_transactions` | Transaction history from `ACTUAL_DB_PATH` with optional filters (see below) |
-| `get_live_transactions` | Live transactions from Liberado Budget REST; `start_date` and `end_date` are applied by the API |
+| `get_live_transactions` | Live transactions from Liberado Budget REST for one account or one category. For totals across categories use `live_spending`; for rows across categories use `budget_api_transactions_by_category` |
 | `list_categories` | Category groups and categories |
-| `list_payees` | All payees |
+| `list_payees` | Payee lookup. `search` (substring) and `prefix` are case-insensitive. `compact=true` returns id and name (`compact=1`). `limit` defaults to 100 (max 1000) and `offset` pages. `exclude_empty` defaults to true (`exclude_empty=1`) and drops empty-name transfer payees. Result is `{payees, total, returned, offset, limit, truncated, omitted_empty, compact, exclude_empty, applied}`. Live REST when configured, otherwise `ACTUAL_DB_PATH`. Params are forwarded on `GET /api/v1/payees`; an older server that ignores them or returns 400 is filtered here (`applied` is `client`) |
 | `get_budget_month` | Budgeted vs. actual spending by category for a month, from `ACTUAL_DB_PATH` (allocation and carry are combined) |
 | `get_live_budget_month` | Live month from Liberado Budget REST: allocation, carry, spent, and total budget kept separate |
 | `monthly_summary` | Income, expenses, net savings per month over a range |
@@ -26,13 +26,14 @@ Exposes your budget data as MCP tools so Claude (or any MCP client) can query ac
 | `uncategorized_transactions` | Transactions with no category or reserved Uncategorized (excludes split parents) |
 | `transactions_by_category` | Newest transactions whose category name matches a regex |
 | `budget_api_uncategorized` | Same as uncategorized_transactions, live from Liberado Budget REST |
-| `budget_api_transactions_by_category` | Category-regex transactions from Liberado Budget REST |
+| `budget_api_transactions_by_category` | Rows for many categories in one call. `category_regex` is a regex, so `^(Rent\|Groceries\|Utilities)$` matches several categories. Prefer this over one `get_live_transactions` per category |
 | `get_summary` | Coaching snapshot from Liberado Budget REST: on-budget cash, credit, loans, `next_target`, cashflow (`month`, `extra_cents`, `strategy`) |
 | `list_loans` | Registered loans (balances, APR bps, min payments) from Liberado Budget REST |
 | `loan_projection` | Avalanche/snowball payoff projection (`strategy`, `extra_cents`) |
-| `live_spending` | Spending totals from live REST (authoritative) for `start_date`..`end_date`. Optional `categories`, `category_group`, and `group_by` (`category` default, `week`, or `day`). Excludes transfers and income. Includes a SimpleFIN `sync` object |
+| `live_spending` | Spending totals for many categories in one call (omit `categories` for every category, or pass a `categories` array). Prefer this over one `get_live_transactions` per category. Optional `category_group` and `group_by` (`category` default, `week`, or `day`). Excludes transfers and income. Includes the category group and a SimpleFIN `sync` object |
 | `simplefin_status` | SimpleFIN link status from live REST (authoritative): configured, linked account names, `cursor_epoch`, and sync timestamps when the server sends them. Does not call sync or claim |
-| `upcoming` | Predicted bills and paydays from live REST (authoritative). Optional `days` (1..=365) and `lookback_months` (1..=36). `kind` is `income` or `expense` |
+| `list_schedule_overrides` | Saved upcoming schedule rows, including hidden dismissals (`GET /api/v1/upcoming/schedules`). Pure detections are not listed. Requires liberado-budget#44 |
+| `upcoming` | Predicted bills and paydays from live REST. `expand=true` sends `expand=1` and returns every occurrence in the horizon (`schedule_id`, `occurrence`; the row `id` is `schedule_id#date`). Omit `expand` for one next date. If the server cannot expand, `expanded` is false and `expand_note` says to infer later dates. `source` is `detected`, `override`, or `manual`. `confidence` is 0..1 for detections and 1 for overrides. Schedules key on `payee_id`. `stale`, `possible_duplicate_of`, and `duplicate_reason` come from the budget API when present; otherwise the same 15% / newer-`last_date` rule is applied here. `schedule_warnings` lists those pairs. Hide a saved schedule with `dismiss_schedule_override`; tombstone one with `clear_schedule_override` |
 | `get_credit_terms` | Credit terms for one account (id or name) from live REST (authoritative): `apr_bps` and `min_payment_cents` |
 | `balance_history` | Month-by-month running account balance |
 | `net_worth` | Total balance across all on-budget accounts |
@@ -52,7 +53,9 @@ That sentence is the MCP server description (`initialize` → `serverInfo.descri
 | `create_category` | Create an envelope category |
 | `update_category` | Rename or hide a category |
 | `create_payee` | Create a payee by display name |
-| `rename_payee` | Rename a payee |
+| `rename_payee` | Rename a payee. Keeps the same payee id, so that payee's schedule stays put. A second payee id is a second schedule. Does not merge payees. Hide a leftover schedule with `dismiss_schedule_override`; let detection return with `clear_schedule_override` |
+| `dismiss_schedule_override` | Hide a saved upcoming schedule (`DELETE /api/v1/upcoming/schedules/{schedule_id}`). Pass `schedule_id`, not an occurrence id (`schedule_id#date`). Detection stays suppressed. Requires liberado-budget#44 |
+| `clear_schedule_override` | Tombstone a saved upcoming schedule (`POST /api/v1/upcoming/schedules/{schedule_id}/clear`) so detection can return. Idempotent. Requires liberado-budget#44 |
 | `set_transaction_category` | Set one transaction's category |
 | `set_transaction_payee` | Set one transaction's payee |
 | `categorize_transactions` | Bulk-assign category; optional learn-from-payees |
@@ -122,7 +125,7 @@ Debt, coaching, and import tools also go through REST (`get_summary`,
 dated transactions, and the envelope month use `list_live_accounts`,
 `get_live_transactions`, and `get_live_budget_month`. Money is integer cents.
 
-`live_spending` totals a date range from `GET /api/v1/spending/by-category` or paged `GET /api/v1/transactions`. Weeks are Monday-start ISO weeks of the stored America/Chicago dates. Transfers and income are excluded, and the result includes a SimpleFIN `sync` object. `simplefin_status` reads `GET /api/v1/simplefin/status` and `GET /api/v1/simplefin/links` and does not call sync or claim. `upcoming` is `GET /api/v1/upcoming`. `get_credit_terms` reads, and `set_credit_terms` writes, `/api/v1/accounts/{id}/credit-terms`.
+`live_spending` totals a date range from `GET /api/v1/spending/by-category` or paged `GET /api/v1/transactions`. Weeks are Monday-start ISO weeks of the stored America/Chicago dates. Transfers and income are excluded, and the result includes a SimpleFIN `sync` object. `simplefin_status` reads `GET /api/v1/simplefin/status` and `GET /api/v1/simplefin/links` and does not call sync or claim. `upcoming` is `GET /api/v1/upcoming` (`expand=1` projects later occurrences). `list_schedule_overrides`, `dismiss_schedule_override`, and `clear_schedule_override` are `GET`, `DELETE`, and `POST .../clear` on `/api/v1/upcoming/schedules`. Those three need the budget API from liberado-budget#44. `get_credit_terms` reads, and `set_credit_terms` writes, `/api/v1/accounts/{id}/credit-terms`.
 
 `get_summary` is `GET /api/v1/summary` — the coaching snapshot agents should
 use instead of curling accounts + loans + ranking rules. Optional `month`
