@@ -12,6 +12,10 @@ use std::collections::{BTreeMap, HashSet};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
+use crate::forecast::{compact_forecast, resolve_forecast, today_utc, FORECAST_MISSING};
+use crate::payees::{project_payees, PayeeQuery};
+use crate::upcoming_flags::annotate_upcoming;
+
 /// Tool-facing 401. The response body is dropped so a server that echoes the
 /// header cannot leak `LIBERADO_BUDGET_API_KEY` through this error.
 const API_KEY_REJECTED: &str =
@@ -662,11 +666,13 @@ impl BudgetApi {
     ///
     /// `days` (1..=365) and `lookback_months` (1..=36) are sent only when set.
     /// Values outside those ranges are rejected here; the server would clamp
-    /// them. Does not create or delete schedules.
+    /// them. `expand` sends `expand=1` so the server projects every occurrence
+    /// in the horizon. A 400 is retried without `expand` (an older server).
     pub async fn upcoming(
         &self,
         days: Option<i64>,
         lookback_months: Option<i64>,
+        expand: Option<bool>,
     ) -> Result<Value, String> {
         if let Some(days) = days {
             if !(1..=365).contains(&days) {
@@ -678,6 +684,7 @@ impl BudgetApi {
                 return Err("lookback_months must be between 1 and 36".into());
             }
         }
+        let expand = expand.unwrap_or(false);
         let mut parts = Vec::new();
         if let Some(days) = days {
             parts.push(format!("days={days}"));
@@ -685,12 +692,88 @@ impl BudgetApi {
         if let Some(months) = lookback_months {
             parts.push(format!("lookback_months={months}"));
         }
-        let path = if parts.is_empty() {
+        let base = if parts.is_empty() {
             "/api/v1/upcoming".to_string()
         } else {
             format!("/api/v1/upcoming?{}", parts.join("&"))
         };
-        self.get(&path).await
+        let doc = if expand {
+            let path = if parts.is_empty() {
+                "/api/v1/upcoming?expand=1".to_string()
+            } else {
+                format!("{base}&expand=1")
+            };
+            match self.get(&path).await {
+                Err(err) if is_budget_status(&err, 400) => self.get(&base).await?,
+                other => other?,
+            }
+        } else {
+            self.get(&base).await?
+        };
+        Ok(annotate_upcoming(doc, expand))
+    }
+
+    /// One calendar month of expected income, bills, and leftover (`GET /api/v1/forecast`).
+    ///
+    /// `month` defaults to the month after today (UTC). `variable_months` defaults
+    /// to 2. Amounts in the result are dollar strings. A 404 means this budget
+    /// API has no `/forecast` endpoint; nothing else is called in its place.
+    pub async fn forecast_month(
+        &self,
+        month: Option<&str>,
+        variable_months: Option<i64>,
+    ) -> Result<Value, String> {
+        let query = resolve_forecast(month, variable_months, &today_utc())?;
+        let path = format!(
+            "/api/v1/forecast?month={}&variable_months={}",
+            encode_query(&query.month),
+            query.variable_months
+        );
+        let doc = match self.get(&path).await {
+            Err(err) if is_budget_status(&err, 404) => return Err(FORECAST_MISSING.into()),
+            other => other?,
+        };
+        Ok(compact_forecast(&doc))
+    }
+
+    /// Saved schedule rows, including hidden dismissals (`GET /api/v1/upcoming/schedules`).
+    pub async fn list_schedule_overrides(&self) -> Result<Value, String> {
+        self.get("/api/v1/upcoming/schedules").await
+    }
+
+    /// Hide a saved schedule so detection cannot bring it back
+    /// (`DELETE /api/v1/upcoming/schedules/{schedule_id}`).
+    pub async fn dismiss_schedule_override(&self, schedule_id: &str) -> Result<Value, String> {
+        let id = encode_schedule_id(schedule_id)?;
+        self.delete(&format!("/api/v1/upcoming/schedules/{id}"))
+            .await
+    }
+
+    /// Tombstone a saved schedule so detection can return
+    /// (`POST /api/v1/upcoming/schedules/{schedule_id}/clear`).
+    pub async fn clear_schedule_override(&self, schedule_id: &str) -> Result<Value, String> {
+        let id = encode_schedule_id(schedule_id)?;
+        self.post(
+            &format!("/api/v1/upcoming/schedules/{id}/clear"),
+            &json!({}),
+        )
+        .await
+    }
+
+    /// `GET /api/v1/payees`, then a client-side page.
+    ///
+    /// Search, prefix, limit, offset, compact, and exclude_empty are forwarded
+    /// as query parameters (`compact=1`, `exclude_empty=1`). An older server
+    /// that ignores them, or returns 400, is retried on the bare path and
+    /// [`project_payees`] applies the filters. A response that already echoes
+    /// `total` and a page within `limit` is not sliced a second time.
+    pub async fn list_payees(&self, query: &PayeeQuery) -> Result<Value, String> {
+        let path = payees_path(query);
+        let doc = match self.get(&path).await {
+            Err(err) if is_budget_status(&err, 400) => self.get("/api/v1/payees").await?,
+            other => other?,
+        };
+        Ok(project_payees(&doc, query))
     }
 
     /// `GET /api/v1/accounts/{id}/credit-terms`. `account` is an id or name.
@@ -1235,6 +1318,35 @@ fn validate_iso_date(name: &str, value: Option<&str>) -> Result<(), String> {
         return Err(format!("Invalid {name} '{value}'; expected YYYY-MM-DD"));
     }
     Ok(())
+}
+
+fn payees_path(query: &PayeeQuery) -> String {
+    let mut parts = Vec::new();
+    push_query(&mut parts, "search", query.search.as_deref());
+    push_query(&mut parts, "prefix", query.prefix.as_deref());
+    parts.push(format!("limit={}", query.limit));
+    parts.push(format!("offset={}", query.offset));
+    if query.compact {
+        parts.push("compact=1".into());
+    }
+    if query.exclude_empty {
+        parts.push("exclude_empty=1".into());
+    }
+    format!("/api/v1/payees?{}", parts.join("&"))
+}
+
+fn encode_schedule_id(schedule_id: &str) -> Result<String, String> {
+    let id = schedule_id.trim();
+    if id.is_empty() {
+        return Err("schedule_id is required".into());
+    }
+    if id.contains('#') {
+        return Err(
+            "schedule_id must be the schedule id, not an occurrence id (those contain # and a date). Use the schedule_id field from upcoming."
+                .into(),
+        );
+    }
+    Ok(encode_query(id))
 }
 
 fn push_query(parts: &mut Vec<String>, key: &str, value: Option<&str>) {
@@ -3843,7 +3955,7 @@ mod tests {
             .to_string(),
         )]);
         let api = BudgetApi::new(base);
-        let v = api.upcoming(Some(14), Some(3)).await.unwrap();
+        let v = api.upcoming(Some(14), Some(3), None).await.unwrap();
         assert_eq!(v["today"], "2026-10-21");
         assert_eq!(v["horizon_days"], 14);
         assert_eq!(v["bills"][0]["kind"], "expense");
@@ -3860,7 +3972,7 @@ mod tests {
             json!({"today": "2026-10-21", "horizon_days": 60, "bills": []}).to_string(),
         )]);
         let api = BudgetApi::new(base);
-        let v = api.upcoming(None, None).await.unwrap();
+        let v = api.upcoming(None, None, None).await.unwrap();
         assert_eq!(v["horizon_days"], 60);
         assert!(v["bills"].as_array().unwrap().is_empty());
         h.join().unwrap();
@@ -3869,20 +3981,425 @@ mod tests {
     #[tokio::test]
     async fn upcoming_rejects_out_of_range_query() {
         let api = BudgetApi::new("http://127.0.0.1:1");
-        let days = api.upcoming(Some(0), None).await.unwrap_err();
+        let days = api.upcoming(Some(0), None, None).await.unwrap_err();
         assert!(days.contains("days must be between 1 and 365"), "{days}");
-        let days = api.upcoming(Some(366), Some(6)).await.unwrap_err();
+        let days = api.upcoming(Some(366), Some(6), None).await.unwrap_err();
         assert!(days.contains("days must be between 1 and 365"), "{days}");
-        let months = api.upcoming(Some(30), Some(0)).await.unwrap_err();
+        let months = api.upcoming(Some(30), Some(0), None).await.unwrap_err();
         assert!(
             months.contains("lookback_months must be between 1 and 36"),
             "{months}"
         );
-        let months = api.upcoming(None, Some(37)).await.unwrap_err();
+        let months = api.upcoming(None, Some(37), None).await.unwrap_err();
         assert!(
             months.contains("lookback_months must be between 1 and 36"),
             "{months}"
         );
+    }
+
+    #[tokio::test]
+    async fn upcoming_annotates_a_duplicate_pair() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/upcoming HTTP".into(),
+            200,
+            json!({
+                "today": "2026-11-20",
+                "horizon_days": 60,
+                "bills": [
+                    {
+                        "id": "old:rent",
+                        "payee_id": "p-old",
+                        "payee_name": "ACH Withdrawal VENMO PAYMENT",
+                        "category_id": "rent",
+                        "category_name": "Rent",
+                        "mean_amount_cents": -185000,
+                        "last_date": "2026-09-02",
+                        "next_date": "2026-12-01",
+                        "interval_days": 30,
+                        "cadence": "monthly",
+                        "source": "override",
+                        "confidence": 1.0
+                    },
+                    {
+                        "id": "new:rent",
+                        "payee_id": "p-new",
+                        "payee_name": "Transfer to Venmo",
+                        "category_id": "rent",
+                        "category_name": "Rent",
+                        "mean_amount_cents": -185000,
+                        "last_date": "2026-11-02",
+                        "next_date": "2026-12-02",
+                        "interval_days": 30,
+                        "cadence": "monthly",
+                        "source": "detected",
+                        "confidence": 1.0
+                    }
+                ]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.upcoming(None, None, None).await.unwrap();
+        assert_eq!(v["expanded"], false);
+        assert!(v.get("schedules_mutable").is_none());
+        assert_eq!(v["bills"][0]["stale"], true);
+        assert_eq!(v["bills"][0]["possible_duplicate_of"], "new:rent");
+        assert_eq!(v["bills"][1]["stale"], false);
+        assert_eq!(
+            v["schedule_warnings"][0]["other_payee"],
+            "Transfer to Venmo"
+        );
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upcoming_expand_keeps_server_duplicate_fields() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "expand=1".into(),
+            200,
+            json!({
+                "today": "2026-11-20",
+                "horizon_days": 60,
+                "expanded": true,
+                "duplicate_rule": "server",
+                "bills": [{
+                    "id": "old:rent#2026-12-01",
+                    "schedule_id": "old:rent",
+                    "payee_id": "p-old",
+                    "payee_name": "ACH Withdrawal VENMO PAYMENT",
+                    "category_id": "rent",
+                    "category_name": "Rent",
+                    "mean_amount_cents": -185000,
+                    "last_date": "2026-09-02",
+                    "next_date": "2026-12-01",
+                    "interval_days": 30,
+                    "stale": false,
+                    "possible_duplicate_of": null
+                }]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.upcoming(Some(60), None, Some(true)).await.unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.contains("/api/v1/upcoming?days=60&expand=1"), "{req}");
+        assert_eq!(v["expanded"], true);
+        assert_eq!(v["bills"][0]["stale"], false);
+        assert!(v["bills"][0]["possible_duplicate_of"].is_null());
+        assert!(v.get("expand_note").is_none());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upcoming_expand_falls_back_when_the_server_rejects_it() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "expand=1".into(),
+                400,
+                json!({"error": "unknown parameter"}).to_string(),
+            ),
+            (
+                "/api/v1/upcoming?days=60 HTTP".into(),
+                200,
+                json!({
+                    "today": "2026-11-20",
+                    "horizon_days": 60,
+                    "bills": []
+                })
+                .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.upcoming(Some(60), None, Some(true)).await.unwrap();
+        assert_eq!(v["expanded"], false);
+        assert!(v["expand_note"]
+            .as_str()
+            .unwrap()
+            .contains("one occurrence"));
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_schedule_overrides_reads_saved_rows() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/upcoming/schedules HTTP".into(),
+            200,
+            json!({
+                "schedules": [{"id": "old:rent", "hidden": true, "source": "override"}],
+                "source_legend": {}
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.list_schedule_overrides().await.unwrap();
+        assert_eq!(v["schedules"][0]["id"], "old:rent");
+        assert_eq!(v["schedules"][0]["hidden"], true);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dismiss_schedule_override_hides_by_schedule_id() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "DELETE /api/v1/upcoming/schedules/payee-old%3Acat-rent".into(),
+            200,
+            json!({"deleted": "payee-old:cat-rent", "hidden": true}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .dismiss_schedule_override("payee-old:cat-rent")
+            .await
+            .unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.starts_with("DELETE "), "{req}");
+        assert!(!req.contains('#'), "{req}");
+        assert_eq!(v["hidden"], true);
+        assert_eq!(v["deleted"], "payee-old:cat-rent");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_schedule_override_tombstones() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "POST /api/v1/upcoming/schedules/payee-old%3Acat-rent/clear".into(),
+            200,
+            json!({"cleared": "payee-old:cat-rent", "removed": true}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api
+            .clear_schedule_override("  payee-old:cat-rent  ")
+            .await
+            .unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.starts_with("POST "), "{req}");
+        assert!(req.contains("/clear"), "{req}");
+        assert_eq!(v["removed"], true);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_override_rejects_occurrence_ids() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let empty = api.dismiss_schedule_override("  ").await.unwrap_err();
+        assert!(empty.contains("schedule_id is required"), "{empty}");
+        let occurrence = api
+            .clear_schedule_override("old:rent#2026-12-01")
+            .await
+            .unwrap_err();
+        assert!(occurrence.contains("occurrence id"), "{occurrence}");
+    }
+
+    #[tokio::test]
+    async fn forecast_month_compacts_dollars_and_keeps_bill_schedule_ids() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "/api/v1/forecast?month=2026-12&variable_months=2".into(),
+            200,
+            json!({
+                "month": "2026-12",
+                "as_of": "2026-11-20",
+                "income": {
+                    "total_cents": 281954,
+                    "items": [{
+                        "date": "2026-12-08",
+                        "payee": "Raytheon",
+                        "amount_cents": 281954,
+                        "schedule_id": "ray:pay"
+                    }]
+                },
+                "bills": {
+                    "total_cents": -185000,
+                    "items": [{
+                        "date": "2026-12-02",
+                        "payee": "Transfer to Venmo",
+                        "category": "Rent",
+                        "amount_cents": -185000,
+                        "last_actual_cents": null,
+                        "last_date": "2026-11-02",
+                        "schedule_id": "p-new:rent",
+                        "flags": ["stale"]
+                    }]
+                },
+                "leftover_after_bills_cents": 96954,
+                "variable_spending": {
+                    "basis_months": ["2026-10", "2026-11"],
+                    "total_cents": -42000,
+                    "by_category": [{"category": "Groceries", "group": "Food", "avg_cents": -21000}]
+                },
+                "projected_net_cents": 54954,
+                "budget": {"allocated_cents": 0, "carry_cents": 0, "is_empty": true},
+                "on_budget_cash_cents": 100,
+                "warnings": []
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.forecast_month(Some("2026-12"), None).await.unwrap();
+        let req = rx.recv().unwrap();
+        assert!(
+            req.contains("GET /api/v1/forecast?month=2026-12&variable_months=2"),
+            "{req}"
+        );
+        assert_eq!(v["income"]["total"], "$2819.54");
+        assert_eq!(v["income"]["items"][0]["schedule_id"], "ray:pay");
+        assert_eq!(v["bills"]["items"][0]["amount"], "-$1850.00");
+        assert_eq!(v["bills"]["items"][0]["schedule_id"], "p-new:rent");
+        assert_eq!(v["bills"]["items"][0]["flags"][0], "stale");
+        assert!(v["bills"]["items"][0].get("last_actual").is_none());
+        assert_eq!(v["bills"]["items"][0]["last_date"], "2026-11-02");
+        assert_eq!(v["leftover_after_bills"], "$969.54");
+        assert_eq!(v["variable_spending"]["by_category"][0]["avg"], "-$210.00");
+        assert_eq!(v["on_budget_cash"], "$1.00");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn forecast_month_defaults_to_next_month() {
+        let month = crate::forecast::next_month_after(&crate::forecast::today_utc()).unwrap();
+        let (base, h, rx) = spawn_request_mock(vec![(
+            format!("/api/v1/forecast?month={month}&variable_months=2"),
+            200,
+            json!({
+                "month": month,
+                "income": {"total_cents": 0, "items": []},
+                "bills": {"total_cents": 0, "items": []},
+                "leftover_after_bills_cents": 0,
+                "variable_spending": {"basis_months": [], "total_cents": 0, "by_category": []},
+                "projected_net_cents": 0,
+                "budget": {"allocated_cents": 0, "carry_cents": 0, "is_empty": true},
+                "on_budget_cash_cents": 0,
+                "warnings": []
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.forecast_month(None, None).await.unwrap();
+        let req = rx.recv().unwrap();
+        assert!(
+            req.contains(&format!("month={month}&variable_months=2")),
+            "{req}"
+        );
+        assert_eq!(v["month"], month);
+        assert_eq!(v["projected_net"], "$0.00");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn forecast_month_says_when_the_endpoint_is_missing() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/forecast".into(),
+            404,
+            json!({"error": "not found"}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let err = api
+            .forecast_month(Some("2026-12"), Some(2))
+            .await
+            .unwrap_err();
+        assert!(err.contains("lacks /forecast"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn forecast_month_rejects_a_bad_month_without_a_request() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let err = api
+            .forecast_month(Some("December"), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("YYYY-MM"), "{err}");
+    }
+
+    fn payee_query_venmo(limit: i64) -> crate::payees::PayeeQuery {
+        crate::payees::PayeeQuery::from_args(
+            Some("Venmo"),
+            None,
+            Some(limit),
+            None,
+            Some(true),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_payees_filters_a_server_that_ignores_query_params() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "search=Venmo".into(),
+            200,
+            json!({
+                "payees": [
+                    {"id": "empty", "name": "", "transfer_account_id": "a"},
+                    {"id": "venmo", "name": "Transfer to Venmo", "transfer_account_id": "b"},
+                    {"id": "other", "name": "Landlord"}
+                ]
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.list_payees(&payee_query_venmo(10)).await.unwrap();
+        let req = rx.recv().unwrap();
+        assert!(req.contains("search=Venmo"), "{req}");
+        assert!(req.contains("limit=10"), "{req}");
+        assert!(req.contains("exclude_empty=1"), "{req}");
+        assert!(req.contains("compact=1"), "{req}");
+        assert!(!req.contains("include_empty"), "{req}");
+        assert_eq!(v["applied"], "client");
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["omitted_empty"], 1);
+        assert_eq!(v["payees"][0]["id"], "venmo");
+        assert!(v["payees"][0].get("transfer_account_id").is_none());
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_payees_retries_bare_path_when_params_are_rejected() {
+        let (base, h) = spawn_json_mock(vec![
+            (
+                "search=Venmo".into(),
+                400,
+                json!({"error": "unknown parameter"}).to_string(),
+            ),
+            (
+                "/api/v1/payees HTTP".into(),
+                200,
+                json!({
+                    "payees": [
+                        {"id": "venmo", "name": "Transfer to Venmo"},
+                        {"id": "other", "name": "Spotify"}
+                    ]
+                })
+                .to_string(),
+            ),
+        ]);
+        let api = BudgetApi::new(base);
+        let v = api.list_payees(&payee_query_venmo(5)).await.unwrap();
+        assert_eq!(v["applied"], "client");
+        assert_eq!(v["payees"][0]["name"], "Transfer to Venmo");
+        assert_eq!(v["total"], 1);
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_payees_keeps_a_server_page() {
+        let (base, h) = spawn_json_mock(vec![(
+            "search=Venmo".into(),
+            200,
+            json!({
+                "payees": [{"id": "venmo", "name": "Transfer to Venmo"}],
+                "total": 3,
+                "offset": 0,
+                "limit": 1,
+                "truncated": true
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.list_payees(&payee_query_venmo(1)).await.unwrap();
+        assert_eq!(v["applied"], "server");
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["returned"], 1);
+        h.join().unwrap();
     }
 
     fn card_accounts() -> String {
