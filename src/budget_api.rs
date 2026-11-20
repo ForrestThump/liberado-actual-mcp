@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
+use crate::forecast::{compact_forecast, resolve_forecast, today_utc, FORECAST_MISSING};
 use crate::payees::{project_payees, PayeeQuery};
 use crate::upcoming_flags::annotate_upcoming;
 
@@ -710,6 +711,29 @@ impl BudgetApi {
             self.get(&base).await?
         };
         Ok(annotate_upcoming(doc, expand))
+    }
+
+    /// One calendar month of expected income, bills, and leftover (`GET /api/v1/forecast`).
+    ///
+    /// `month` defaults to the month after today (UTC). `variable_months` defaults
+    /// to 2. Amounts in the result are dollar strings. A 404 means this budget
+    /// API has no `/forecast` endpoint; nothing else is called in its place.
+    pub async fn forecast_month(
+        &self,
+        month: Option<&str>,
+        variable_months: Option<i64>,
+    ) -> Result<Value, String> {
+        let query = resolve_forecast(month, variable_months, &today_utc())?;
+        let path = format!(
+            "/api/v1/forecast?month={}&variable_months={}",
+            encode_query(&query.month),
+            query.variable_months
+        );
+        let doc = match self.get(&path).await {
+            Err(err) if is_budget_status(&err, 404) => return Err(FORECAST_MISSING.into()),
+            other => other?,
+        };
+        Ok(compact_forecast(&doc))
     }
 
     /// Saved schedule rows, including hidden dismissals (`GET /api/v1/upcoming/schedules`).
@@ -4162,6 +4186,127 @@ mod tests {
             .await
             .unwrap_err();
         assert!(occurrence.contains("occurrence id"), "{occurrence}");
+    }
+
+    #[tokio::test]
+    async fn forecast_month_compacts_dollars_and_keeps_bill_schedule_ids() {
+        let (base, h, rx) = spawn_request_mock(vec![(
+            "/api/v1/forecast?month=2026-12&variable_months=2".into(),
+            200,
+            json!({
+                "month": "2026-12",
+                "as_of": "2026-11-20",
+                "income": {
+                    "total_cents": 281954,
+                    "items": [{
+                        "date": "2026-12-08",
+                        "payee": "Raytheon",
+                        "amount_cents": 281954,
+                        "schedule_id": "ray:pay"
+                    }]
+                },
+                "bills": {
+                    "total_cents": -185000,
+                    "items": [{
+                        "date": "2026-12-02",
+                        "payee": "Transfer to Venmo",
+                        "category": "Rent",
+                        "amount_cents": -185000,
+                        "last_actual_cents": null,
+                        "last_date": "2026-11-02",
+                        "schedule_id": "p-new:rent",
+                        "flags": ["stale"]
+                    }]
+                },
+                "leftover_after_bills_cents": 96954,
+                "variable_spending": {
+                    "basis_months": ["2026-10", "2026-11"],
+                    "total_cents": -42000,
+                    "by_category": [{"category": "Groceries", "group": "Food", "avg_cents": -21000}]
+                },
+                "projected_net_cents": 54954,
+                "budget": {"allocated_cents": 0, "carry_cents": 0, "is_empty": true},
+                "on_budget_cash_cents": 100,
+                "warnings": []
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.forecast_month(Some("2026-12"), None).await.unwrap();
+        let req = rx.recv().unwrap();
+        assert!(
+            req.contains("GET /api/v1/forecast?month=2026-12&variable_months=2"),
+            "{req}"
+        );
+        assert_eq!(v["income"]["total"], "$2819.54");
+        assert_eq!(v["income"]["items"][0]["schedule_id"], "ray:pay");
+        assert_eq!(v["bills"]["items"][0]["amount"], "-$1850.00");
+        assert_eq!(v["bills"]["items"][0]["schedule_id"], "p-new:rent");
+        assert_eq!(v["bills"]["items"][0]["flags"][0], "stale");
+        assert!(v["bills"]["items"][0].get("last_actual").is_none());
+        assert_eq!(v["bills"]["items"][0]["last_date"], "2026-11-02");
+        assert_eq!(v["leftover_after_bills"], "$969.54");
+        assert_eq!(v["variable_spending"]["by_category"][0]["avg"], "-$210.00");
+        assert_eq!(v["on_budget_cash"], "$1.00");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn forecast_month_defaults_to_next_month() {
+        let month = crate::forecast::next_month_after(&crate::forecast::today_utc()).unwrap();
+        let (base, h, rx) = spawn_request_mock(vec![(
+            format!("/api/v1/forecast?month={month}&variable_months=2"),
+            200,
+            json!({
+                "month": month,
+                "income": {"total_cents": 0, "items": []},
+                "bills": {"total_cents": 0, "items": []},
+                "leftover_after_bills_cents": 0,
+                "variable_spending": {"basis_months": [], "total_cents": 0, "by_category": []},
+                "projected_net_cents": 0,
+                "budget": {"allocated_cents": 0, "carry_cents": 0, "is_empty": true},
+                "on_budget_cash_cents": 0,
+                "warnings": []
+            })
+            .to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let v = api.forecast_month(None, None).await.unwrap();
+        let req = rx.recv().unwrap();
+        assert!(
+            req.contains(&format!("month={month}&variable_months=2")),
+            "{req}"
+        );
+        assert_eq!(v["month"], month);
+        assert_eq!(v["projected_net"], "$0.00");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn forecast_month_says_when_the_endpoint_is_missing() {
+        let (base, h) = spawn_json_mock(vec![(
+            "/api/v1/forecast".into(),
+            404,
+            json!({"error": "not found"}).to_string(),
+        )]);
+        let api = BudgetApi::new(base);
+        let err = api
+            .forecast_month(Some("2026-12"), Some(2))
+            .await
+            .unwrap_err();
+        assert!(err.contains("lacks /forecast"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+        h.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn forecast_month_rejects_a_bad_month_without_a_request() {
+        let api = BudgetApi::new("http://127.0.0.1:1");
+        let err = api
+            .forecast_month(Some("December"), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("YYYY-MM"), "{err}");
     }
 
     fn payee_query_venmo(limit: i64) -> crate::payees::PayeeQuery {

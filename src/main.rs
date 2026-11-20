@@ -1,6 +1,7 @@
 mod actual;
 mod budget_api;
 mod db;
+mod forecast;
 mod models;
 mod pattern;
 mod payees;

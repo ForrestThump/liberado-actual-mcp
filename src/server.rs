@@ -242,7 +242,7 @@ impl ActualServer {
 #[turbomcp::server(
     name = "actual-budget-mcp",
     version = "0.1.0",
-    description = "Live REST tools (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `live_spending`, `simplefin_status`, `upcoming`, `get_summary`, `list_loans`, `loan_projection`, budget_api_*) are authoritative; ACTUAL_DB_PATH SQLite tools can lag; writes go through REST only."
+    description = "Live REST tools (`list_live_accounts`, `get_live_transactions`, `get_live_budget_month`, `live_spending`, `simplefin_status`, `forecast_month`, `upcoming`, `get_summary`, `list_loans`, `loan_projection`, budget_api_*) are authoritative; ACTUAL_DB_PATH SQLite tools can lag; writes go through REST only."
 )]
 impl ActualServer {
     #[tool(
@@ -452,7 +452,8 @@ impl ActualServer {
             Does not read ACTUAL_DB_PATH. Does not treat the combined budgeted_cents \
             figure as the allocation. If the API only returns that sum, this tool errors \
             and names the ForrestThump/liberado-budget gap instead of guessing. \
-            set_budget_allocations writes the allocation only and leaves carry rows alone."
+            set_budget_allocations writes the allocation only and leaves carry rows alone. \
+            For expected bills, paychecks, and leftover in a month, call forecast_month instead."
     )]
     async fn get_live_budget_month(&self, month: String) -> McpResult<String> {
         month_to_ym(&month).ok_or_else(|| {
@@ -1198,7 +1199,8 @@ impl ActualServer {
             Transfers (rows with transfer_id) and income are excluded. \
             Returns per-bucket and per-category totals in integer cents plus display, \
             transaction counts, and a sync object from SimpleFIN status. \
-            Does not call SimpleFIN sync or claim."
+            Does not call SimpleFIN sync or claim. For expected bills, paychecks, \
+            and leftover in one calendar month, call forecast_month instead."
     )]
     async fn live_spending(
         &self,
@@ -1238,7 +1240,37 @@ impl ActualServer {
     }
 
     #[tool(
-        "Predicted bills and paydays from live REST (authoritative). Call it once. \
+        "One calendar month of expected income, bills, and what is left over, from \
+            live REST. This is the tool for \"what bills and paychecks should I \
+            expect in <month>\" and \"what's left over\". Call it once. \
+            GET /api/v1/forecast. The result already includes every occurrence in \
+            that month, so do not also call upcoming, live_spending, or \
+            get_live_budget_month for this question. \
+            month is YYYY-MM. Omit it for next month (the month after today, UTC). \
+            variable_months is how many recent months are averaged into variable \
+            spending (default 2, allowed 0 to 36). \
+            Amounts are ledger-signed dollars. Bill and income rows keep \
+            schedule_id. Null fields are omitted. \
+            A budget API that has no /forecast endpoint returns an error saying \
+            so. This tool does not invent the month from upcoming or spending."
+    )]
+    async fn forecast_month(
+        &self,
+        month: Option<String>,
+        variable_months: Option<i64>,
+    ) -> McpResult<String> {
+        let api = self.budget_writes()?;
+        let v = api
+            .forecast_month(month.as_deref(), variable_months)
+            .await
+            .map_err(budget_api_error)?;
+        json_result(&v)
+    }
+
+    #[tool(
+        "Predicted bills and paydays from live REST (authoritative). For bills, \
+            paychecks, and leftover in one calendar month, call forecast_month \
+            once instead. Call this once when you need the rolling horizon. \
             GET /api/v1/upcoming. \
             days is an optional horizon from 1 to 365 (server default 60). \
             lookback_months is optional history from 1 to 36 (server default 6). \
